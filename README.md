@@ -138,7 +138,7 @@ wl-clip-persist --clipboard regular --all-mime-type-regex '^(?!x-kde-passwordMan
 
 ## Build from source
 * Install `rustup` to get the `rust` compiler installed on your system. [Install rustup](https://www.rust-lang.org/en-US/install.html)
-* Rust version 1.81.0 or later is required
+* Rust version 1.82.0 or later is required
 * Build in release mode: `cargo build --release`
 * The resulting executable can be found at `target/release/wl-clip-persist`
 

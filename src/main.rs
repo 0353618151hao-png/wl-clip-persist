@@ -20,7 +20,6 @@ async fn main() {
 
     loop {
         match wayland::run(settings.clone(), is_reconnect).await {
-            Ok(_) => unreachable!(),
             Err(WaylandError::ConnectError(err)) => {
                 if is_reconnect {
                     if settings.reconnect_tries.is_some() {
