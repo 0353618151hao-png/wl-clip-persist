@@ -1,19 +1,21 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
+use std::fmt::Debug;
 use std::fs::File;
+use std::marker::PhantomData;
 use std::os::unix::fs::MetadataExt;
 use std::rc::Rc;
 
 use wayrs_client::global::{BindError, Global, GlobalExt as _};
-use wayrs_client::object::ObjectId;
+use wayrs_client::object::{ObjectId, Proxy};
 use wayrs_client::protocol::WlSeat;
-use wayrs_client::proxy::Proxy as _;
 use wayrs_client::{ConnectError, Connection};
-use wayrs_protocols::wlr_data_control_unstable_v1::{
-    ZwlrDataControlDeviceV1, ZwlrDataControlManagerV1, ZwlrDataControlOfferV1,
-};
 
 use crate::logger;
+use crate::protocol_traits::{
+    DataControlDeviceEvent, DataControlDeviceV1, DataControlManagerV1, DataControlOfferEvent, DataControlOfferV1,
+    DataControlSourceV1, FromEvent,
+};
 use crate::settings::Settings;
 use crate::wayland::data_control_device_cb;
 
@@ -24,28 +26,38 @@ pub(crate) enum WaylandError {
 }
 
 #[derive(Debug)]
-pub(crate) struct State {
+pub(crate) struct State<
+    DataControlOffer: DataControlOfferV1,
+    DataControlSource: DataControlSourceV1,
+    DataControlDevice: DataControlDeviceV1<DataControlSource>,
+    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
+> {
     pub(crate) settings: Settings,
-    pub(crate) data_control_manager: ZwlrDataControlManagerV1,
-    pub(crate) seats: HashMap<u32, Seat>,
+    pub(crate) data_control_manager: DataControlManager,
+    pub(crate) seats: HashMap<u32, Seat<DataControlOffer, DataControlSource, DataControlDevice>>,
 }
 
 #[derive(Debug)]
-pub(crate) struct Seat {
+pub(crate) struct Seat<
+    DataControlOffer: DataControlOfferV1,
+    DataControlSource: DataControlSourceV1,
+    DataControlDevice: DataControlDeviceV1<DataControlSource>,
+> {
     pub(crate) seat_name: u32,
     pub(crate) wl_seat: WlSeat,
-    pub(crate) data_control_device: ZwlrDataControlDeviceV1,
+    pub(crate) data_control_device: DataControlDevice,
     /// We temporarily save the offers because it is unknown whether
     /// they are regular or primary selection offers.
-    pub(crate) selection_offers: HashMap<ObjectId, Offer>,
+    pub(crate) selection_offers: HashMap<ObjectId, Offer<DataControlOffer>>,
     /// The current regular selection state. Is [`None`], if not activated in settings.
-    pub(crate) regular_selection: Option<SeatSelectionState>,
+    pub(crate) regular_selection: Option<SeatSelectionState<DataControlOffer>>,
     /// The current primary selection state. Is [`None`], if not activated in settings.
-    pub(crate) primary_selection: Option<SeatSelectionState>,
+    pub(crate) primary_selection: Option<SeatSelectionState<DataControlOffer>>,
     /// Used to check if we got a new regular selection during the roundtrip.
     pub(crate) got_new_regular_selection: bool,
     /// Used to check if we got a new primary selection during the roundtrip.
     pub(crate) got_new_primary_selection: bool,
+    _phantom: PhantomData<DataControlSource>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -63,16 +75,27 @@ impl SelectionType {
     }
 }
 
-impl Seat {
+impl<
+        DataControlOffer: DataControlOfferV1,
+        DataControlSource: DataControlSourceV1,
+        DataControlDevice: DataControlDeviceV1<DataControlSource>,
+    > Seat<DataControlOffer, DataControlSource, DataControlDevice>
+{
     /// Binds a [`Global`] to create a new [`Seat`].
     ///
     /// The global should be a seat.
-    pub(crate) fn bind(
-        connection: &mut Connection<State>,
-        data_control_manager: ZwlrDataControlManagerV1,
+    pub(crate) fn bind<DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>>(
+        connection: &mut Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
+        data_control_manager: DataControlManager,
         global: &Global,
         settings: &Settings,
-    ) -> Result<Self, BindError> {
+    ) -> Result<Self, BindError>
+    where
+        <DataControlDevice as Proxy>::Event: Debug,
+        DataControlDeviceEvent<DataControlOffer>: FromEvent<<DataControlDevice as Proxy>::Event>,
+        DataControlOfferEvent: FromEvent<<DataControlOffer as Proxy>::Event>,
+        DataControlOffer: 'static,
+    {
         let seat = global.bind(connection, 1..=9)?;
         let seat_name = global.name;
         let data_control_device =
@@ -89,13 +112,14 @@ impl Seat {
             primary_selection: settings.clipboard_type.primary().then(SeatSelectionState::default),
             got_new_regular_selection: false,
             got_new_primary_selection: false,
+            _phantom: PhantomData,
         })
     }
 
     /// Iterates over mutable regular and primary selection data.
     pub(crate) fn selections_iter_mut(
         &mut self,
-    ) -> impl Iterator<Item = (SelectionType, Option<&mut SeatSelectionState>)> {
+    ) -> impl Iterator<Item = (SelectionType, Option<&mut SeatSelectionState<DataControlOffer>>)> {
         std::iter::once((SelectionType::Regular, self.regular_selection.as_mut())).chain(std::iter::once((
             SelectionType::Primary,
             self.primary_selection.as_mut(),
@@ -108,8 +132,8 @@ impl Seat {
     ) -> impl Iterator<
         Item = (
             SelectionType,
-            Option<&mut SeatSelectionState>,
-            &HashMap<ObjectId, Offer>,
+            Option<&mut SeatSelectionState<DataControlOffer>>,
+            &HashMap<ObjectId, Offer<DataControlOffer>>,
         ),
     > {
         std::iter::once((
@@ -125,7 +149,10 @@ impl Seat {
     }
 
     /// Destroys the seat.
-    pub(crate) fn destroy(self, conn: &mut Connection<State>) {
+    pub(crate) fn destroy<DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>>(
+        self,
+        conn: &mut Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
+    ) {
         for offer in self.selection_offers.into_values() {
             offer.data_control_offer.destroy(conn);
         }
@@ -147,16 +174,16 @@ impl Seat {
 }
 
 #[derive(Debug)]
-pub(crate) struct Offer {
-    pub(crate) data_control_offer: ZwlrDataControlOfferV1,
+pub(crate) struct Offer<DataControlOffer: DataControlOfferV1> {
+    pub(crate) data_control_offer: DataControlOffer,
     pub(crate) ordered_mime_types: Vec<Rc<Box<CStr>>>,
     pub(crate) unique_mime_types: HashSet<Rc<Box<CStr>>>,
     pub(crate) bytes_read: u64,
     pub(crate) bytes_exceeded_limit: bool,
 }
 
-impl From<ZwlrDataControlOfferV1> for Offer {
-    fn from(data_control_offer: ZwlrDataControlOfferV1) -> Self {
+impl<DataControlOffer: DataControlOfferV1> From<DataControlOffer> for Offer<DataControlOffer> {
+    fn from(data_control_offer: DataControlOffer) -> Self {
         Self {
             data_control_offer,
             ordered_mime_types: Vec::with_capacity(32),
@@ -188,25 +215,31 @@ pub(crate) enum ReadToDataError {
 }
 
 #[derive(Debug)]
-pub(crate) struct MimeTypesWithData<'a> {
+pub(crate) struct MimeTypesWithData<
+    'a,
+    DataControlOffer: DataControlOfferV1,
+    DataControlSource: DataControlSourceV1,
+    DataControlDevice: DataControlDeviceV1<DataControlSource>,
+> {
     pub(crate) seat_name: u32,
-    pub(crate) data_control_device: ZwlrDataControlDeviceV1,
-    pub(crate) selection_offers: &'a HashMap<ObjectId, Offer>,
-    pub(crate) selection_state: &'a mut SeatSelectionState,
+    pub(crate) data_control_device: DataControlDevice,
+    pub(crate) selection_offers: &'a HashMap<ObjectId, Offer<DataControlOffer>>,
+    pub(crate) selection_state: &'a mut SeatSelectionState<DataControlOffer>,
     pub(crate) selection_type: SelectionType,
     pub(crate) ordered_mime_types: Vec<Rc<Box<CStr>>>,
     pub(crate) data: HashMap<Rc<Box<CStr>>, Box<[u8]>>,
+    pub(crate) _phantom: PhantomData<DataControlSource>,
 }
 
 /// Describes the current state of handling the selection event.
 #[derive(Debug, Default)]
-pub(crate) enum SeatSelectionState {
+pub(crate) enum SeatSelectionState<DataControlOffer: DataControlOfferV1> {
     /// Waiting for new offers.
     #[default]
     WaitingForNewOffers,
     /// We read the mime types of the offer.
     ReadMimes {
-        data_control_offer: ZwlrDataControlOfferV1,
+        data_control_offer: DataControlOffer,
         ordered_mime_types: Vec<Rc<Box<CStr>>>,
         unique_mime_types: HashSet<Rc<Box<CStr>>>,
         bytes_read: u64,
@@ -238,9 +271,16 @@ pub(crate) enum SeatSelectionState {
     GotIgnoredEvent,
 }
 
-impl SeatSelectionState {
+impl<DataControlOffer: DataControlOfferV1> SeatSelectionState<DataControlOffer> {
     /// Switches to the initial state [`SeatSelectionState::WaitingForNewOffers`].
-    pub(crate) fn reset(&mut self, conn: &mut Connection<State>) {
+    pub(crate) fn reset<
+        DataControlSource: DataControlSourceV1,
+        DataControlDevice: DataControlDeviceV1<DataControlSource>,
+        DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
+    >(
+        &mut self,
+        conn: &mut Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
+    ) {
         // Destroy old wayland objects
         self.destroy(conn);
 
@@ -248,10 +288,14 @@ impl SeatSelectionState {
     }
 
     /// Switches to the [`SeatSelectionState::ReadMimes`] state.
-    pub(crate) fn read_mimes(
+    pub(crate) fn read_mimes<
+        DataControlSource: DataControlSourceV1,
+        DataControlDevice: DataControlDeviceV1<DataControlSource>,
+        DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
+    >(
         &mut self,
-        conn: &mut Connection<State>,
-        data_control_offer: ZwlrDataControlOfferV1,
+        conn: &mut Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
+        data_control_offer: DataControlOffer,
         ordered_mime_types: Vec<Rc<Box<CStr>>>,
         unique_mime_types: HashSet<Rc<Box<CStr>>>,
         bytes_read: u64,
@@ -269,7 +313,15 @@ impl SeatSelectionState {
     }
 
     /// Switches to the [`SeatSelectionState::GotPipes`] state.
-    pub(crate) fn got_pipes(&mut self, conn: &mut Connection<State>, pipes: Vec<MimeTypeAndPipe>) {
+    pub(crate) fn got_pipes<
+        DataControlSource: DataControlSourceV1,
+        DataControlDevice: DataControlDeviceV1<DataControlSource>,
+        DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
+    >(
+        &mut self,
+        conn: &mut Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
+        pipes: Vec<MimeTypeAndPipe>,
+    ) {
         let SeatSelectionState::ReadMimes {
             data_control_offer,
             ordered_mime_types,
@@ -311,7 +363,14 @@ impl SeatSelectionState {
     }
 
     /// Switches to the [`SeatSelectionState::GotClear`] state.
-    pub(crate) fn got_clear(&mut self, conn: &mut Connection<State>) {
+    pub(crate) fn got_clear<
+        DataControlSource: DataControlSourceV1,
+        DataControlDevice: DataControlDeviceV1<DataControlSource>,
+        DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
+    >(
+        &mut self,
+        conn: &mut Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
+    ) {
         // Destroy old wayland objects
         self.destroy(conn);
 
@@ -319,7 +378,14 @@ impl SeatSelectionState {
     }
 
     /// Switches to the [`SeatSelectionState::GotIgnoredEvent`] state.
-    pub(crate) fn got_ignored_event(&mut self, conn: &mut Connection<State>) {
+    pub(crate) fn got_ignored_event<
+        DataControlSource: DataControlSourceV1,
+        DataControlDevice: DataControlDeviceV1<DataControlSource>,
+        DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
+    >(
+        &mut self,
+        conn: &mut Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
+    ) {
         // Destroy old wayland objects
         self.destroy(conn);
 
@@ -327,7 +393,14 @@ impl SeatSelectionState {
     }
 
     /// Destroys wayland objects in current state.
-    pub(crate) fn destroy(&mut self, conn: &mut Connection<State>) {
+    pub(crate) fn destroy<
+        DataControlSource: DataControlSourceV1,
+        DataControlDevice: DataControlDeviceV1<DataControlSource>,
+        DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
+    >(
+        &mut self,
+        conn: &mut Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
+    ) {
         match self {
             SeatSelectionState::WaitingForNewOffers => {}
             SeatSelectionState::ReadMimes {

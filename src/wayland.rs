@@ -2,7 +2,9 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::ffi::CStr;
+use std::fmt::Debug;
 use std::fs::File;
+use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::ops::Deref;
 use std::os::fd::{IntoRawFd, OwnedFd};
@@ -18,19 +20,28 @@ use wayrs_client::object::ObjectId;
 use wayrs_client::protocol::*;
 use wayrs_client::proxy::Proxy;
 use wayrs_client::{Connection, EventCtx};
-use wayrs_protocols::wlr_data_control_unstable_v1::*;
+use wayrs_protocols::ext_data_control_v1::{
+    ExtDataControlDeviceV1, ExtDataControlManagerV1, ExtDataControlOfferV1, ExtDataControlSourceV1,
+};
+use wayrs_protocols::wlr_data_control_unstable_v1::{
+    ZwlrDataControlDeviceV1, ZwlrDataControlManagerV1, ZwlrDataControlOfferV1, ZwlrDataControlSourceV1,
+};
+use wl_registry::GlobalArgs;
 
 use crate::async_io::FdWrite;
 use crate::logger::{log_default_target, log_seat_target};
+use crate::protocol_traits::{
+    DataControlDeviceEvent, DataControlDeviceV1, DataControlManagerV1, DataControlOfferEvent, DataControlOfferV1,
+    DataControlSourceEvent, DataControlSourceV1, FromEvent,
+};
 use crate::settings::Settings;
 use crate::states::*;
 
 /// Runs the wayland client until a wayland error occurs.
 pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infallible, WaylandError> {
-    let (mut connection, globals) = Connection::async_connect_and_collect_globals()
+    let (mut connection, globals) = Connection::<Infallible>::async_connect_and_collect_globals()
         .await
         .map_err(WaylandError::ConnectError)?;
-    connection.add_registry_cb(wl_registry_cb);
 
     if is_reconnect {
         log::info!(target: log_default_target(), "Connection to wayland server re-established");
@@ -38,24 +49,75 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
         log::trace!(target: log_default_target(), "Connection to wayland server established");
     }
 
-    let data_control_manager_result = if settings.clipboard_type.primary() {
-        globals.bind(&mut connection, 2)
-    } else {
-        globals.bind(&mut connection, 1..=2)
-    };
-    let data_control_manager = match data_control_manager_result {
-        Ok(data_control_manager) => data_control_manager,
-        Err(err) => {
-            let mut default = "Failed to get clipboard manager (ZwlrDataControlManagerV1)".to_string();
-
-            if settings.clipboard_type.primary() && matches!(err, BindError::UnsupportedVersion { actual: 1, min: _ }) {
-                default += "\nPerhaps the primary clipboard is not supported by your compositor?";
-            }
-
-            log::error!(target: log_default_target(), "{}\nError: {}", default, err);
-            std::process::exit(1);
+    match globals.bind::<ExtDataControlManagerV1, _>(&mut connection, 1) {
+        Ok(ext_data_control_manager) => {
+            let connection = connection.clear_callbacks::<State<
+                ExtDataControlOfferV1,
+                ExtDataControlSourceV1,
+                ExtDataControlDeviceV1,
+                ExtDataControlManagerV1,
+            >>();
+            run_with_connection(connection, globals, ext_data_control_manager, settings)
+                .await
+                .map_err(WaylandError::IoError)
         }
-    };
+        Err(_) => {
+            let zwlr_data_control_manager_result = if settings.clipboard_type.primary() {
+                globals.bind::<ZwlrDataControlManagerV1, _>(&mut connection, 2)
+            } else {
+                globals.bind::<ZwlrDataControlManagerV1, _>(&mut connection, 1..=2)
+            };
+
+            match zwlr_data_control_manager_result {
+                Ok(zwlr_data_control_manager) => {
+                    let connection = connection.clear_callbacks::<State<
+                        ZwlrDataControlOfferV1,
+                        ZwlrDataControlSourceV1,
+                        ZwlrDataControlDeviceV1,
+                        ZwlrDataControlManagerV1,
+                    >>();
+                    run_with_connection(connection, globals, zwlr_data_control_manager, settings)
+                        .await
+                        .map_err(WaylandError::IoError)
+                }
+                Err(err) => {
+                    let mut default = "Failed to get clipboard manager.".to_string();
+
+                    if settings.clipboard_type.primary()
+                        && matches!(err, BindError::UnsupportedVersion { actual: 1, min: _ })
+                    {
+                        default += "\nPerhaps the primary clipboard is not supported by your compositor?\nTry to run this program with --clipboard regular.";
+                    } else {
+                        default += "\nYour compositor seems to neither support the ext-data-control-v1 nor wlr-data-control-unstable-v1 Wayland protocol, and is thus unsupported.";
+                    }
+
+                    log::error!(target: log_default_target(), "{}\nError: {}", default, err);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// Runs the wayland client until a wayland error occurs.
+async fn run_with_connection<
+    DataControlOffer: DataControlOfferV1 + 'static,
+    DataControlSource: DataControlSourceV1 + 'static,
+    DataControlDevice: DataControlDeviceV1<DataControlSource> + 'static,
+    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice> + 'static,
+>(
+    mut connection: Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
+    globals: Vec<GlobalArgs>,
+    data_control_manager: DataControlManager,
+    settings: Settings,
+) -> Result<Infallible, std::io::Error>
+where
+    <DataControlDevice as Proxy>::Event: Debug,
+    DataControlDeviceEvent<DataControlOffer>: FromEvent<<DataControlDevice as Proxy>::Event>,
+    DataControlOfferEvent: FromEvent<<DataControlOffer as Proxy>::Event>,
+    DataControlSourceEvent: FromEvent<<DataControlSource as Proxy>::Event>,
+{
+    connection.add_registry_cb(wl_registry_cb);
 
     let seats = globals
         .iter()
@@ -91,7 +153,7 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
     };
 
     // Advertise the bindings to the wayland server
-    connection.async_flush().await.map_err(WaylandError::IoError)?;
+    connection.async_flush().await?;
 
     loop {
         let received_wayland_events = 'wait: loop {
@@ -134,7 +196,7 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
                 biased;
 
                 recv_events = connection.async_recv_events() => {
-                    recv_events.map_err(WaylandError::IoError)?;
+                    recv_events?;
                     drop(set_clipboard_futures);
                     break 'wait true;
                 }
@@ -175,9 +237,7 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
 
         if received_wayland_events {
             connection.dispatch_events(&mut state);
-            handle_new_selection_state(&mut connection, &mut state)
-                .await
-                .map_err(WaylandError::IoError)?;
+            handle_new_selection_state(&mut connection, &mut state).await?;
 
             // Now that we received and dispatched new wayland events, check if we can set the clipboard now.
             // Also notice, we do this before the async flush.
@@ -220,12 +280,25 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
             }
         }
 
-        connection.async_flush().await.map_err(WaylandError::IoError)?;
+        connection.async_flush().await?;
     }
 }
 
 /// Handles the registration of globals, in this case seats.
-fn wl_registry_cb(connection: &mut Connection<State>, state: &mut State, event: &wl_registry::Event) {
+fn wl_registry_cb<
+    DataControlOffer: DataControlOfferV1 + 'static,
+    DataControlSource: DataControlSourceV1,
+    DataControlDevice: DataControlDeviceV1<DataControlSource>,
+    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
+>(
+    connection: &mut Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
+    state: &mut State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>,
+    event: &wl_registry::Event,
+) where
+    <DataControlDevice as Proxy>::Event: Debug,
+    DataControlDeviceEvent<DataControlOffer>: FromEvent<<DataControlDevice as Proxy>::Event>,
+    DataControlOfferEvent: FromEvent<<DataControlOffer as Proxy>::Event>,
+{
     match event {
         wl_registry::Event::Global(global) if global.is::<WlSeat>() => {
             match Seat::bind(connection, state.data_control_manager, global, &state.settings) {
@@ -261,28 +334,44 @@ fn wl_registry_cb(connection: &mut Connection<State>, state: &mut State, event: 
                 log::trace!(target: &log_seat_target(*name), "Removed seat");
             }
         }
-        fallback => {
-            log::debug!(target: log_default_target(), "wl_registry::Event: unhandled event: {:?}", fallback);
-        }
     }
 }
 
 /// Handles the selection events of a seat.
-pub(crate) fn data_control_device_cb(seat_name: u32, event_context: EventCtx<State, ZwlrDataControlDeviceV1>) {
+pub(crate) fn data_control_device_cb<
+    DataControlOffer: DataControlOfferV1 + 'static,
+    DataControlSource: DataControlSourceV1,
+    DataControlDevice: DataControlDeviceV1<DataControlSource>,
+    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
+>(
+    seat_name: u32,
+    event_context: EventCtx<
+        State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>,
+        DataControlDevice,
+    >,
+) where
+    <DataControlDevice as Proxy>::Event: Debug,
+    DataControlDeviceEvent<DataControlOffer>: FromEvent<<DataControlDevice as Proxy>::Event>,
+    DataControlOfferEvent: FromEvent<<DataControlOffer as Proxy>::Event>,
+{
     let maybe_seat = event_context.state.seats.get_mut(&seat_name);
 
     let Some(seat) = maybe_seat else {
         log::warn!(
             target: log_default_target(),
-            "Received ZwlrDataControlDeviceV1 event for unknown seat {}: {:?}",
+            "Received {}::Event for unknown seat {}: {:?}",
+            DataControlDevice::TYPE_NAME,
             seat_name,
             event_context.event,
         );
         return;
     };
 
-    match event_context.event {
-        zwlr_data_control_device_v1::Event::DataOffer(data_offer) => {
+    match <DataControlDeviceEvent<DataControlOffer> as FromEvent<<DataControlDevice as Proxy>::Event>>::from(
+        seat_name,
+        event_context.event,
+    ) {
+        Some(DataControlDeviceEvent::DataOffer(data_offer)) => {
             let offer = Offer::from(data_offer);
 
             if let Some(old_offer) = seat.selection_offers.insert(data_offer.id(), offer) {
@@ -306,7 +395,7 @@ pub(crate) fn data_control_device_cb(seat_name: u32, event_context: EventCtx<Sta
                     data_control_offer_cb(seat_name, data_offer.id(), offer_event_context);
                 });
         }
-        zwlr_data_control_device_v1::Event::Selection(maybe_offer_id) => {
+        Some(DataControlDeviceEvent::Selection(maybe_offer_id)) => {
             let maybe_offer = maybe_offer_id.and_then(|offer_id| seat.selection_offers.remove(&offer_id));
 
             if let Some(offer_id) = &maybe_offer_id {
@@ -361,7 +450,7 @@ pub(crate) fn data_control_device_cb(seat_name: u32, event_context: EventCtx<Sta
                 }
             }
         }
-        zwlr_data_control_device_v1::Event::PrimarySelection(maybe_offer_id) => {
+        Some(DataControlDeviceEvent::PrimarySelection(maybe_offer_id)) => {
             let maybe_offer = maybe_offer_id.and_then(|offer_id| seat.selection_offers.remove(&offer_id));
 
             if let Some(offer_id) = &maybe_offer_id {
@@ -416,7 +505,7 @@ pub(crate) fn data_control_device_cb(seat_name: u32, event_context: EventCtx<Sta
                 }
             }
         }
-        zwlr_data_control_device_v1::Event::Finished => {
+        Some(DataControlDeviceEvent::Finished) => {
             if let Some(seat) = event_context.state.seats.remove(&seat_name) {
                 seat.destroy(event_context.conn);
                 log::trace!(
@@ -430,24 +519,29 @@ pub(crate) fn data_control_device_cb(seat_name: u32, event_context: EventCtx<Sta
                 );
             }
         }
-        fallback => {
-            log::debug!(
-                target: &log_seat_target(seat_name),
-                "zwlr_data_control_device_v1::Event: unhandled event: {:?}",
-                fallback,
-            );
-        }
+        None => {}
     }
 }
 
 /// Handles the events for a selection offer, i.e. which mime types are offered.
-fn data_control_offer_cb(
+fn data_control_offer_cb<
+    DataControlOffer: DataControlOfferV1,
+    DataControlSource: DataControlSourceV1,
+    DataControlDevice: DataControlDeviceV1<DataControlSource>,
+    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
+>(
     seat_name: u32,
     data_offer_id: ObjectId,
-    event_context: EventCtx<State, ZwlrDataControlOfferV1>,
-) {
-    match event_context.event {
-        zwlr_data_control_offer_v1::Event::Offer(mime_type) => {
+    event_context: EventCtx<
+        State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>,
+        DataControlOffer,
+    >,
+) where
+    DataControlOfferEvent: FromEvent<<DataControlOffer as Proxy>::Event>,
+{
+    match <DataControlOfferEvent as FromEvent<<DataControlOffer as Proxy>::Event>>::from(seat_name, event_context.event)
+    {
+        Some(DataControlOfferEvent::Offer(mime_type)) => {
             let Some(seat) = event_context.state.seats.get_mut(&seat_name) else {
                 log::warn!(
                     target: log_default_target(),
@@ -502,13 +596,7 @@ fn data_control_offer_cb(
 
             offer.ordered_mime_types.push(rc_mime_type);
         }
-        fallback => {
-            log::debug!(
-                target: &log_seat_target(seat_name),
-                "zwlr_data_control_offer_v1::Event: unhandled event: {:?}",
-                fallback,
-            );
-        }
+        None => {}
     }
 }
 
@@ -518,7 +606,15 @@ fn data_control_offer_cb(
 /// * mime types exceed size limit
 /// * no mime types were offered
 /// * not all mime types match the regex
-fn should_ignore_offer(settings: &Settings, seat_name: u32, selection_type: SelectionType, offer: &Offer) -> bool {
+fn should_ignore_offer<DataControlOffer: DataControlOfferV1>(
+    settings: &Settings,
+    seat_name: u32,
+    selection_type: SelectionType,
+    offer: &Offer<DataControlOffer>,
+) -> bool
+where
+    DataControlOfferEvent: FromEvent<<DataControlOffer as Proxy>::Event>,
+{
     if offer.bytes_exceeded_limit {
         log::trace!(
             target: &log_seat_target(seat_name),
@@ -623,11 +719,16 @@ fn should_ignore_offer(settings: &Settings, seat_name: u32, selection_type: Sele
 ///
 /// The `unique_mime_types` value is always replaced with
 /// an empty [`Vec`].
-fn create_pipes_for_mime_types(
-    connection: &mut Connection<State>,
+fn create_pipes_for_mime_types<
+    DataControlOffer: DataControlOfferV1,
+    DataControlSource: DataControlSourceV1,
+    DataControlDevice: DataControlDeviceV1<DataControlSource>,
+    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
+>(
+    connection: &mut Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
     seat_name: u32,
     selection_type: SelectionType,
-    data_control_offer: ZwlrDataControlOfferV1,
+    data_control_offer: DataControlOffer,
     unique_mime_types: &mut HashSet<Rc<Box<CStr>>>,
     fd_from_own_app: &mut HashMap<FdIdentifier, bool>,
     ignore_selection_event_on_error: bool,
@@ -719,7 +820,15 @@ fn create_pipes_for_mime_types(
 /// # Errors
 ///
 /// Only Wayland errors are returned.
-async fn handle_new_selection_state(connection: &mut Connection<State>, state: &mut State) -> std::io::Result<()> {
+async fn handle_new_selection_state<
+    DataControlOffer: DataControlOfferV1,
+    DataControlSource: DataControlSourceV1,
+    DataControlDevice: DataControlDeviceV1<DataControlSource>,
+    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
+>(
+    connection: &mut Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
+    state: &mut State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>,
+) -> std::io::Result<()> {
     'handle_new_selection_state: loop {
         let selection_pipes = state
             .seats
@@ -1030,15 +1139,23 @@ async fn read_pipes_to_data(
 /// If this function returns [`Ok`], the value in
 /// [`SeatSelectionState::GotPipes::ordered_mime_types`]
 /// has been replaced with an empty [`Vec`].
-async fn handle_pipes_selection_state<'a>(
+async fn handle_pipes_selection_state<
+    'a,
+    DataControlOffer: DataControlOfferV1,
+    DataControlSource: DataControlSourceV1,
+    DataControlDevice: DataControlDeviceV1<DataControlSource>,
+>(
     seat_name: u32,
-    data_control_device: ZwlrDataControlDeviceV1,
-    selection_offers: &'a HashMap<ObjectId, Offer>,
+    data_control_device: DataControlDevice,
+    selection_offers: &'a HashMap<ObjectId, Offer<DataControlOffer>>,
     selection_type: SelectionType,
-    selection_state: &'a mut SeatSelectionState,
+    selection_state: &'a mut SeatSelectionState<DataControlOffer>,
     size_limit: Option<NonZeroU64>,
     ignore_selection_event_on_error: bool,
-) -> Result<MimeTypesWithData<'a>, &'a mut SeatSelectionState> {
+) -> Result<
+    MimeTypesWithData<'a, DataControlOffer, DataControlSource, DataControlDevice>,
+    &'a mut SeatSelectionState<DataControlOffer>,
+> {
     let SeatSelectionState::GotPipes {
         ordered_mime_types,
         pipes,
@@ -1113,18 +1230,32 @@ async fn handle_pipes_selection_state<'a>(
         selection_type,
         ordered_mime_types: owned_ordered_mime_types,
         data,
+        _phantom: PhantomData,
     })
 }
 
 /// Handles clipboard data requests.
-fn data_source_cb(
+fn data_source_cb<
+    DataControlOffer: DataControlOfferV1,
+    DataControlSource: DataControlSourceV1 + 'static,
+    DataControlDevice: DataControlDeviceV1<DataControlSource>,
+    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
+>(
     seat_name: u32,
     selection_type: SelectionType,
-    event_context: EventCtx<State, ZwlrDataControlSourceV1>,
+    event_context: EventCtx<
+        State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>,
+        DataControlSource,
+    >,
     data_map: &Arc<HashMap<Box<CStr>, Box<[u8]>>>,
-) {
-    match event_context.event {
-        zwlr_data_control_source_v1::Event::Send(send) => {
+) where
+    DataControlSourceEvent: FromEvent<<DataControlSource as Proxy>::Event>,
+{
+    match <DataControlSourceEvent as FromEvent<<DataControlSource as Proxy>::Event>>::from(
+        seat_name,
+        event_context.event,
+    ) {
+        Some(DataControlSourceEvent::Send(send)) => {
             log::trace!(
                 target: &log_seat_target(seat_name),
                 "{} clipboard data source {}: received new request for mime type {:?}",
@@ -1262,7 +1393,7 @@ fn data_source_cb(
                 }
             });
         }
-        zwlr_data_control_source_v1::Event::Cancelled => {
+        Some(DataControlSourceEvent::Cancelled) => {
             event_context.proxy.destroy(event_context.conn);
 
             log::trace!(
@@ -1272,28 +1403,30 @@ fn data_source_cb(
                 event_context.proxy.id().as_u32(),
             );
         }
-        fallback => {
-            log::debug!(
-                target: &log_seat_target(seat_name),
-                "zwlr_data_control_source_v1::Event: unhandled event: {:?}",
-                fallback
-            );
-        }
+        None => {}
     }
 }
 
 /// Sets the clipboard for a specific seat and selection type.
-#[allow(clippy::too_many_arguments)]
-fn set_clipboard(
-    connection: &mut Connection<State>,
-    data_control_manager: ZwlrDataControlManagerV1,
+#[expect(clippy::too_many_arguments)]
+fn set_clipboard<
+    DataControlOffer: DataControlOfferV1,
+    DataControlSource: DataControlSourceV1 + 'static,
+    DataControlDevice: DataControlDeviceV1<DataControlSource>,
+    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
+>(
+    connection: &mut Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
+    data_control_manager: DataControlManager,
     seat_name: u32,
-    data_control_device: ZwlrDataControlDeviceV1,
-    selection_state: &mut SeatSelectionState,
+    data_control_device: DataControlDevice,
+    selection_state: &mut SeatSelectionState<DataControlOffer>,
     selection_type: SelectionType,
     ordered_mime_types: Vec<Rc<Box<CStr>>>,
     data: HashMap<Rc<Box<CStr>>, Box<[u8]>>,
-) {
+) where
+    DataControlOfferEvent: FromEvent<<DataControlOffer as Proxy>::Event>,
+    DataControlSourceEvent: FromEvent<<DataControlSource as Proxy>::Event>,
+{
     let source = data_control_manager.create_data_source(connection);
     for mime_type in ordered_mime_types {
         // Some mime types might have gotten ignored due to errors.

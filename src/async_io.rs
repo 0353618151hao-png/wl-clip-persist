@@ -28,7 +28,7 @@ fn set_non_blocking(fd: RawFd) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-pub struct FdWrite(AsyncFd<OwnedFd>);
+pub(crate) struct FdWrite(AsyncFd<OwnedFd>);
 
 impl TryFrom<OwnedFd> for FdWrite {
     type Error = std::io::Error;

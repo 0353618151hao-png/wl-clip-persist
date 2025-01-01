@@ -1,5 +1,6 @@
 mod async_io;
 mod logger;
+mod protocol_traits;
 mod settings;
 mod states;
 mod wayland;
