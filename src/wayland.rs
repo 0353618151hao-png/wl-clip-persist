@@ -26,7 +26,6 @@ use wayrs_protocols::ext_data_control_v1::{
 use wayrs_protocols::wlr_data_control_unstable_v1::{
     ZwlrDataControlDeviceV1, ZwlrDataControlManagerV1, ZwlrDataControlOfferV1, ZwlrDataControlSourceV1,
 };
-use wl_registry::GlobalArgs;
 
 use crate::async_io::FdWrite;
 use crate::logger::{log_default_target, log_seat_target};
@@ -39,9 +38,7 @@ use crate::states::*;
 
 /// Runs the wayland client until a wayland error occurs.
 pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infallible, WaylandError> {
-    let (mut connection, globals) = Connection::<Infallible>::async_connect_and_collect_globals()
-        .await
-        .map_err(WaylandError::ConnectError)?;
+    let mut connection = Connection::<Infallible>::connect().map_err(WaylandError::ConnectError)?;
 
     if is_reconnect {
         log::info!(target: log_default_target(), "Connection to wayland server re-established");
@@ -49,7 +46,9 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
         log::trace!(target: log_default_target(), "Connection to wayland server established");
     }
 
-    match globals.bind::<ExtDataControlManagerV1, _>(&mut connection, 1) {
+    connection.async_roundtrip().await.map_err(WaylandError::IoError)?;
+
+    match connection.bind_singleton::<ExtDataControlManagerV1>(1) {
         Ok(ext_data_control_manager) => {
             let connection = connection.clear_callbacks::<State<
                 ExtDataControlOfferV1,
@@ -57,15 +56,15 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
                 ExtDataControlDeviceV1,
                 ExtDataControlManagerV1,
             >>();
-            run_with_connection(connection, globals, ext_data_control_manager, settings)
+            run_with_connection(connection, ext_data_control_manager, settings)
                 .await
                 .map_err(WaylandError::IoError)
         }
         Err(_) => {
             let zwlr_data_control_manager_result = if settings.clipboard_type.primary() {
-                globals.bind::<ZwlrDataControlManagerV1, _>(&mut connection, 2)
+                connection.bind_singleton::<ZwlrDataControlManagerV1>(2)
             } else {
-                globals.bind::<ZwlrDataControlManagerV1, _>(&mut connection, 1..=2)
+                connection.bind_singleton::<ZwlrDataControlManagerV1>(1..=2)
             };
 
             match zwlr_data_control_manager_result {
@@ -76,7 +75,7 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
                         ZwlrDataControlDeviceV1,
                         ZwlrDataControlManagerV1,
                     >>();
-                    run_with_connection(connection, globals, zwlr_data_control_manager, settings)
+                    run_with_connection(connection, zwlr_data_control_manager, settings)
                         .await
                         .map_err(WaylandError::IoError)
                 }
@@ -107,7 +106,6 @@ async fn run_with_connection<
     DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice> + 'static,
 >(
     mut connection: Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
-    globals: Vec<GlobalArgs>,
     data_control_manager: DataControlManager,
     settings: Settings,
 ) -> Result<Infallible, std::io::Error>
@@ -117,40 +115,18 @@ where
     DataControlOfferEvent: FromEvent<<DataControlOffer as Proxy>::Event>,
     DataControlSourceEvent: FromEvent<<DataControlSource as Proxy>::Event>,
 {
-    connection.add_registry_cb(wl_registry_cb);
-
-    let seats = globals
-        .iter()
-        .filter(|global| global.is::<WlSeat>())
-        .filter_map(|seat_global| {
-            Seat::bind(&mut connection, data_control_manager, seat_global, &settings)
-                .inspect(|_| {
-                    log::trace!(
-                        target: &log_seat_target(seat_global.name),
-                        "Added seat"
-                    );
-                })
-                .inspect_err(|err| {
-                    log::debug!(
-                        target: &log_seat_target(seat_global.name),
-                        "Failed to bind seat: {}",
-                        err,
-                    );
-                })
-                .ok()
-                .map(|seat| (seat_global.name, seat))
-        })
-        .collect::<HashMap<_, _>>();
-
-    if seats.is_empty() {
-        log::warn!(target: log_default_target(), "No seats found on startup");
-    }
-
     let mut state = State {
         settings,
         data_control_manager,
-        seats,
+        seats: HashMap::with_capacity(4),
     };
+
+    connection.add_registry_cb(wl_registry_cb);
+    connection.dispatch_events(&mut state);
+
+    if state.seats.is_empty() {
+        log::warn!(target: log_default_target(), "No seats found on startup");
+    }
 
     // Advertise the bindings to the wayland server
     connection.async_flush().await?;
