@@ -76,10 +76,10 @@ impl SelectionType {
 }
 
 impl<
-        DataControlOffer: DataControlOfferV1,
-        DataControlSource: DataControlSourceV1,
-        DataControlDevice: DataControlDeviceV1<DataControlSource>,
-    > Seat<DataControlOffer, DataControlSource, DataControlDevice>
+    DataControlOffer: DataControlOfferV1,
+    DataControlSource: DataControlSourceV1,
+    DataControlDevice: DataControlDeviceV1<DataControlSource>,
+> Seat<DataControlOffer, DataControlSource, DataControlDevice>
 {
     /// Binds a [`Global`] to create a new [`Seat`].
     ///

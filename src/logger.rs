@@ -1,6 +1,6 @@
 use chrono::Local;
-use env_logger::fmt::style::{AnsiColor, Color, Style};
 use env_logger::Builder;
+use env_logger::fmt::style::{AnsiColor, Color, Style};
 use log::{Level, LevelFilter};
 
 pub(crate) fn init_logger(with_timestamps: bool) {

@@ -5,8 +5,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures_util::ready;
-use tokio::io::unix::AsyncFd;
 use tokio::io::AsyncWrite;
+use tokio::io::unix::AsyncFd;
 
 const MAX_LEN: usize = <libc::ssize_t>::MAX as _;
 

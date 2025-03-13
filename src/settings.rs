@@ -2,7 +2,7 @@ use std::num::NonZeroU64;
 use std::time::Duration;
 
 use clap::builder::NonEmptyStringValueParser;
-use clap::{arg, crate_description, crate_name, crate_version, value_parser, ArgAction, Command};
+use clap::{ArgAction, Command, arg, crate_description, crate_name, crate_version, value_parser};
 use fancy_regex::Regex;
 
 use crate::logger::{self, log_default_target};

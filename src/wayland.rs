@@ -12,8 +12,8 @@ use std::os::unix::io::FromRawFd;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt as _;
+use futures_util::stream::FuturesUnordered;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wayrs_client::global::*;
 use wayrs_client::object::ObjectId;
