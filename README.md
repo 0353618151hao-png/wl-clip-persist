@@ -81,7 +81,7 @@ wl-clip-persist --clipboard regular --selection-size-limit 1048576
 This option can be used to limit the memory usage.
 
 ### Reconnect tries
-*Default: no limit*
+*Default: 0*
 
 With `--reconnect-tries`, the number of tries to reconnect to the Wayland server after a Wayland error occurred will be limited.
 

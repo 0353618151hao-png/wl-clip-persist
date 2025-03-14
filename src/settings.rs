@@ -1,13 +1,14 @@
 use std::num::NonZeroU64;
+use std::str::FromStr;
 use std::time::Duration;
 
 use clap::builder::NonEmptyStringValueParser;
-use clap::{ArgAction, Command, arg, crate_description, crate_name, crate_version, value_parser};
+use clap::{Arg, ArgAction, Command, arg, crate_description, crate_name, crate_version, value_parser};
 use fancy_regex::Regex;
 
 use crate::logger::{self, log_default_target};
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
 pub(crate) enum ClipboardType {
     Regular,
     Primary,
@@ -32,6 +33,24 @@ impl ClipboardType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NumberOrInf<T: Clone + Copy> {
+    Number(T),
+    Inf,
+}
+
+impl<T: Clone + Copy + FromStr> FromStr for NumberOrInf<T> {
+    type Err = T::Err;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("inf") {
+            Ok(NumberOrInf::Inf)
+        } else {
+            s.parse::<T>().map(NumberOrInf::Number)
+        }
+    }
+}
+
 /// The settings the program was started with.
 #[derive(Debug, Clone)]
 pub(crate) struct Settings {
@@ -46,9 +65,8 @@ pub(crate) struct Settings {
     /// If [`None`], the selection events should not be filtered by a [`Regex`].
     /// Otherwise, all mime types have to match the regex for it to be not ignored.
     pub(crate) all_mime_type_regex: Option<Regex>,
-    /// The number of times a reconnect to the Wayland server should be tried after an error,
-    /// or [`None`] if no limit.
-    pub(crate) reconnect_tries: Option<u64>,
+    /// The number of times a reconnect to the Wayland server should be tried after an error.
+    pub(crate) reconnect_tries: NumberOrInf<u64>,
     /// The delay between two reconnect tries to the Wayland server.
     pub(crate) reconnect_delay: Duration,
 }
@@ -100,11 +118,13 @@ pub(crate) fn get_settings() -> Settings {
             .value_parser(NonEmptyStringValueParser::new()),
         )
         .arg(
-            arg!(
-                --"reconnect-tries" <NUMBER> "Limit the number of tries to reconnect to the Wayland server after a Wayland error"
-            )
+            Arg::new("reconnect-tries")
+            .long("reconnect-tries")
+            .value_name("NUMBER|INF")
+            .help("Limit the number of tries to reconnect to the Wayland server after a Wayland error")
             .required(false)
-            .value_parser(clap::value_parser!(u64)),
+            .value_parser(clap::value_parser!(NumberOrInf<u64>))
+            .default_value("0"),
         )
         .arg(
             arg!(
@@ -144,7 +164,7 @@ pub(crate) fn get_settings() -> Settings {
                 std::process::exit(1);
             }
         });
-    let reconnect_tries = matches.get_one::<u64>("reconnect-tries").copied();
+    let reconnect_tries = *matches.get_one::<NumberOrInf<u64>>("reconnect-tries").unwrap();
     let reconnect_delay = Duration::from_millis(*matches.get_one::<u64>("reconnect-delay").unwrap());
 
     Settings {
