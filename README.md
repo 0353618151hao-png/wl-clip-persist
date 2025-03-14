@@ -5,6 +5,12 @@ Normally, when you copy something on Wayland and then close the application you 
 Whenever you copy something, it reads all the clipboard data into memory and then overwrites the clipboard with the data from our memory.
 By doing so, the data is available even after the program you copied from exits.
 
+## Wayland compositor requirements
+Your compositor has to support at least one of these Wayland protocols:
+
+* ext-data-control-v1
+* wlr-data-control-unstable-v1
+
 ## Usage
 ### Clipboard Type
 When you specify the clipboard to operate on, the clipboard data there will persist.
