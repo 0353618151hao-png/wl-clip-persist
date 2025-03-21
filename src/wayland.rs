@@ -56,6 +56,10 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
                 ExtDataControlDeviceV1,
                 ExtDataControlManagerV1,
             >>();
+            log::trace!(
+                target: log_default_target(),
+                "Using ext-data-control-v1 protocol"
+            );
             run_with_connection(connection, ext_data_control_manager, settings)
                 .await
                 .map_err(WaylandError::IoError)
@@ -75,6 +79,10 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
                         ZwlrDataControlDeviceV1,
                         ZwlrDataControlManagerV1,
                     >>();
+                    log::trace!(
+                        target: log_default_target(),
+                        "Using wlr-data-control-unstable-v1 protocol"
+                    );
                     run_with_connection(connection, zwlr_data_control_manager, settings)
                         .await
                         .map_err(WaylandError::IoError)
