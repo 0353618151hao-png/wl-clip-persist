@@ -90,12 +90,22 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
                 Err(err) => {
                     let mut default = "Failed to get clipboard manager.".to_string();
 
-                    if settings.clipboard_type.primary()
-                        && matches!(err, BindError::UnsupportedVersion { actual: 1, min: _ })
-                    {
-                        default += "\nPerhaps the primary clipboard is not supported by your compositor?\nTry to run this program with --clipboard regular.";
-                    } else {
-                        default += "\nYour compositor seems to neither support the ext-data-control-v1 nor wlr-data-control-unstable-v1 Wayland protocol, and is thus unsupported.";
+                    match err {
+                        BindError::UnsupportedVersion { actual: 1, min: _ } if settings.clipboard_type.primary() => {
+                            default += "\nPerhaps the primary clipboard is not supported by your compositor?\nTry to run this program with --clipboard regular.";
+                        }
+                        BindError::UnsupportedVersion { actual: _, min: _ } => {}
+                        BindError::IncorrectInterface {
+                            actual: _,
+                            requested: _,
+                        } => {}
+                        BindError::GlobalNotFound(_) => {
+                            default += concat!(
+                                "\nEither your compositor does neither support the ext-data-control-v1 nor wlr-data-control-unstable-v1 Wayland protocol, and is thus unsupported, or ",
+                                clap::crate_name!(),
+                                " has not been run as a privileged client."
+                            );
+                        }
                     }
 
                     log::error!(target: log_default_target(), "{}\nError: {}", default, err);
