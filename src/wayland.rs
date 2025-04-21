@@ -2,9 +2,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::ffi::CStr;
-use std::fmt::Debug;
 use std::fs::File;
-use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::ops::Deref;
 use std::os::fd::{IntoRawFd, OwnedFd};
@@ -20,18 +18,15 @@ use wayrs_client::object::ObjectId;
 use wayrs_client::protocol::*;
 use wayrs_client::proxy::Proxy;
 use wayrs_client::{Connection, EventCtx};
-use wayrs_protocols::ext_data_control_v1::{
-    ExtDataControlDeviceV1, ExtDataControlManagerV1, ExtDataControlOfferV1, ExtDataControlSourceV1,
-};
-use wayrs_protocols::wlr_data_control_unstable_v1::{
-    ZwlrDataControlDeviceV1, ZwlrDataControlManagerV1, ZwlrDataControlOfferV1, ZwlrDataControlSourceV1,
-};
+use wayrs_protocols::ext_data_control_v1::ExtDataControlManagerV1;
+use wayrs_protocols::wlr_data_control_unstable_v1::ZwlrDataControlManagerV1;
 
 use crate::async_io::FdWrite;
 use crate::logger::{log_default_target, log_seat_target};
 use crate::protocol_traits::{
     DataControlDeviceEvent, DataControlDeviceV1, DataControlManagerV1, DataControlOfferEvent, DataControlOfferV1,
-    DataControlSourceEvent, DataControlSourceV1, FromEvent,
+    DataControlSourceEvent, DataControlSourceV1, DataControlV1, ExtDataControlV1, TryIntoGenericEvent as _,
+    ZwlrDataControlV1,
 };
 use crate::settings::Settings;
 use crate::states::*;
@@ -50,12 +45,7 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
 
     match connection.bind_singleton::<ExtDataControlManagerV1>(1) {
         Ok(ext_data_control_manager) => {
-            let connection = connection.clear_callbacks::<State<
-                ExtDataControlOfferV1,
-                ExtDataControlSourceV1,
-                ExtDataControlDeviceV1,
-                ExtDataControlManagerV1,
-            >>();
+            let connection = connection.clear_callbacks::<State<ExtDataControlV1>>();
             log::trace!(
                 target: log_default_target(),
                 "Using ext-data-control-v1 protocol"
@@ -73,12 +63,7 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
 
             match zwlr_data_control_manager_result {
                 Ok(zwlr_data_control_manager) => {
-                    let connection = connection.clear_callbacks::<State<
-                        ZwlrDataControlOfferV1,
-                        ZwlrDataControlSourceV1,
-                        ZwlrDataControlDeviceV1,
-                        ZwlrDataControlManagerV1,
-                    >>();
+                    let connection = connection.clear_callbacks::<State<ZwlrDataControlV1>>();
                     log::trace!(
                         target: log_default_target(),
                         "Using wlr-data-control-unstable-v1 protocol"
@@ -117,22 +102,11 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
 }
 
 /// Runs the wayland client until a wayland error occurs.
-async fn run_with_connection<
-    DataControlOffer: DataControlOfferV1 + 'static,
-    DataControlSource: DataControlSourceV1 + 'static,
-    DataControlDevice: DataControlDeviceV1<DataControlSource> + 'static,
-    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice> + 'static,
->(
-    mut connection: Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
-    data_control_manager: DataControlManager,
+async fn run_with_connection<DataControl: DataControlV1>(
+    mut connection: Connection<State<DataControl>>,
+    data_control_manager: DataControl::DataControlManager,
     settings: Settings,
-) -> Result<Infallible, std::io::Error>
-where
-    <DataControlDevice as Proxy>::Event: Debug,
-    DataControlDeviceEvent<DataControlOffer>: FromEvent<<DataControlDevice as Proxy>::Event>,
-    DataControlOfferEvent: FromEvent<<DataControlOffer as Proxy>::Event>,
-    DataControlSourceEvent: FromEvent<<DataControlSource as Proxy>::Event>,
-{
+) -> Result<Infallible, std::io::Error> {
     let mut state = State {
         settings,
         data_control_manager,
@@ -279,20 +253,11 @@ where
 }
 
 /// Handles the registration of globals, in this case seats.
-fn wl_registry_cb<
-    DataControlOffer: DataControlOfferV1 + 'static,
-    DataControlSource: DataControlSourceV1,
-    DataControlDevice: DataControlDeviceV1<DataControlSource>,
-    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
->(
-    connection: &mut Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
-    state: &mut State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>,
+fn wl_registry_cb<DataControl: DataControlV1>(
+    connection: &mut Connection<State<DataControl>>,
+    state: &mut State<DataControl>,
     event: &wl_registry::Event,
-) where
-    <DataControlDevice as Proxy>::Event: Debug,
-    DataControlDeviceEvent<DataControlOffer>: FromEvent<<DataControlDevice as Proxy>::Event>,
-    DataControlOfferEvent: FromEvent<<DataControlOffer as Proxy>::Event>,
-{
+) {
     match event {
         wl_registry::Event::Global(global) if global.is::<WlSeat>() => {
             match Seat::bind(connection, state.data_control_manager, global, &state.settings) {
@@ -332,39 +297,24 @@ fn wl_registry_cb<
 }
 
 /// Handles the selection events of a seat.
-pub(crate) fn data_control_device_cb<
-    DataControlOffer: DataControlOfferV1 + 'static,
-    DataControlSource: DataControlSourceV1,
-    DataControlDevice: DataControlDeviceV1<DataControlSource>,
-    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
->(
+pub(crate) fn data_control_device_cb<DataControl: DataControlV1>(
     seat_name: u32,
-    event_context: EventCtx<
-        State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>,
-        DataControlDevice,
-    >,
-) where
-    <DataControlDevice as Proxy>::Event: Debug,
-    DataControlDeviceEvent<DataControlOffer>: FromEvent<<DataControlDevice as Proxy>::Event>,
-    DataControlOfferEvent: FromEvent<<DataControlOffer as Proxy>::Event>,
-{
+    event_context: EventCtx<State<DataControl>, DataControl::DataControlDevice>,
+) {
     let maybe_seat = event_context.state.seats.get_mut(&seat_name);
 
     let Some(seat) = maybe_seat else {
         log::warn!(
             target: log_default_target(),
             "Received {}::Event for unknown seat {}: {:?}",
-            DataControlDevice::TYPE_NAME,
+            DataControl::DataControlDevice::TYPE_NAME,
             seat_name,
             event_context.event,
         );
         return;
     };
 
-    match <DataControlDeviceEvent<DataControlOffer> as FromEvent<<DataControlDevice as Proxy>::Event>>::from(
-        seat_name,
-        event_context.event,
-    ) {
+    match event_context.event.try_into_generic_event(seat_name) {
         Some(DataControlDeviceEvent::DataOffer(data_offer)) => {
             let offer = Offer::from(data_offer);
 
@@ -518,23 +468,12 @@ pub(crate) fn data_control_device_cb<
 }
 
 /// Handles the events for a selection offer, i.e. which mime types are offered.
-fn data_control_offer_cb<
-    DataControlOffer: DataControlOfferV1,
-    DataControlSource: DataControlSourceV1,
-    DataControlDevice: DataControlDeviceV1<DataControlSource>,
-    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
->(
+fn data_control_offer_cb<DataControl: DataControlV1>(
     seat_name: u32,
     data_offer_id: ObjectId,
-    event_context: EventCtx<
-        State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>,
-        DataControlOffer,
-    >,
-) where
-    DataControlOfferEvent: FromEvent<<DataControlOffer as Proxy>::Event>,
-{
-    match <DataControlOfferEvent as FromEvent<<DataControlOffer as Proxy>::Event>>::from(seat_name, event_context.event)
-    {
+    event_context: EventCtx<State<DataControl>, DataControl::DataControlOffer>,
+) {
+    match event_context.event.try_into_generic_event(seat_name) {
         Some(DataControlOfferEvent::Offer(mime_type)) => {
             let Some(seat) = event_context.state.seats.get_mut(&seat_name) else {
                 log::warn!(
@@ -605,10 +544,7 @@ fn should_ignore_offer<DataControlOffer: DataControlOfferV1>(
     seat_name: u32,
     selection_type: SelectionType,
     offer: &Offer<DataControlOffer>,
-) -> bool
-where
-    DataControlOfferEvent: FromEvent<<DataControlOffer as Proxy>::Event>,
-{
+) -> bool {
     if offer.bytes_exceeded_limit {
         log::trace!(
             target: &log_seat_target(seat_name),
@@ -713,16 +649,11 @@ where
 ///
 /// The `unique_mime_types` value is always replaced with
 /// an empty [`Vec`].
-fn create_pipes_for_mime_types<
-    DataControlOffer: DataControlOfferV1,
-    DataControlSource: DataControlSourceV1,
-    DataControlDevice: DataControlDeviceV1<DataControlSource>,
-    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
->(
-    connection: &mut Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
+fn create_pipes_for_mime_types<DataControl: DataControlV1>(
+    connection: &mut Connection<State<DataControl>>,
     seat_name: u32,
     selection_type: SelectionType,
-    data_control_offer: DataControlOffer,
+    data_control_offer: DataControl::DataControlOffer,
     unique_mime_types: &mut HashSet<Rc<Box<CStr>>>,
     fd_from_own_app: &mut HashMap<FdIdentifier, bool>,
     ignore_selection_event_on_error: bool,
@@ -814,14 +745,9 @@ fn create_pipes_for_mime_types<
 /// # Errors
 ///
 /// Only Wayland errors are returned.
-async fn handle_new_selection_state<
-    DataControlOffer: DataControlOfferV1,
-    DataControlSource: DataControlSourceV1,
-    DataControlDevice: DataControlDeviceV1<DataControlSource>,
-    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
->(
-    connection: &mut Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
-    state: &mut State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>,
+async fn handle_new_selection_state<DataControl: DataControlV1>(
+    connection: &mut Connection<State<DataControl>>,
+    state: &mut State<DataControl>,
 ) -> std::io::Result<()> {
     'handle_new_selection_state: loop {
         let selection_pipes = state
@@ -1133,23 +1059,15 @@ async fn read_pipes_to_data(
 /// If this function returns [`Ok`], the value in
 /// [`SeatSelectionState::GotPipes::ordered_mime_types`]
 /// has been replaced with an empty [`Vec`].
-async fn handle_pipes_selection_state<
-    'a,
-    DataControlOffer: DataControlOfferV1,
-    DataControlSource: DataControlSourceV1,
-    DataControlDevice: DataControlDeviceV1<DataControlSource>,
->(
+async fn handle_pipes_selection_state<'a, DataControl: DataControlV1>(
     seat_name: u32,
-    data_control_device: DataControlDevice,
-    selection_offers: &'a HashMap<ObjectId, Offer<DataControlOffer>>,
+    data_control_device: DataControl::DataControlDevice,
+    selection_offers: &'a HashMap<ObjectId, Offer<DataControl::DataControlOffer>>,
     selection_type: SelectionType,
-    selection_state: &'a mut SeatSelectionState<DataControlOffer>,
+    selection_state: &'a mut SeatSelectionState<DataControl>,
     size_limit: Option<NonZeroU64>,
     ignore_selection_event_on_error: bool,
-) -> Result<
-    MimeTypesWithData<'a, DataControlOffer, DataControlSource, DataControlDevice>,
-    &'a mut SeatSelectionState<DataControlOffer>,
-> {
+) -> Result<MimeTypesWithData<'a, DataControl>, &'a mut SeatSelectionState<DataControl>> {
     let SeatSelectionState::GotPipes {
         ordered_mime_types,
         pipes,
@@ -1224,31 +1142,17 @@ async fn handle_pipes_selection_state<
         selection_type,
         ordered_mime_types: owned_ordered_mime_types,
         data,
-        _phantom: PhantomData,
     })
 }
 
 /// Handles clipboard data requests.
-fn data_source_cb<
-    DataControlOffer: DataControlOfferV1,
-    DataControlSource: DataControlSourceV1 + 'static,
-    DataControlDevice: DataControlDeviceV1<DataControlSource>,
-    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
->(
+fn data_source_cb<DataControl: DataControlV1>(
     seat_name: u32,
     selection_type: SelectionType,
-    event_context: EventCtx<
-        State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>,
-        DataControlSource,
-    >,
+    event_context: EventCtx<State<DataControl>, DataControl::DataControlSource>,
     data_map: &Arc<HashMap<Box<CStr>, Box<[u8]>>>,
-) where
-    DataControlSourceEvent: FromEvent<<DataControlSource as Proxy>::Event>,
-{
-    match <DataControlSourceEvent as FromEvent<<DataControlSource as Proxy>::Event>>::from(
-        seat_name,
-        event_context.event,
-    ) {
+) {
+    match event_context.event.try_into_generic_event(seat_name) {
         Some(DataControlSourceEvent::Send(send)) => {
             log::trace!(
                 target: &log_seat_target(seat_name),
@@ -1403,24 +1307,16 @@ fn data_source_cb<
 
 /// Sets the clipboard for a specific seat and selection type.
 #[expect(clippy::too_many_arguments)]
-fn set_clipboard<
-    DataControlOffer: DataControlOfferV1,
-    DataControlSource: DataControlSourceV1 + 'static,
-    DataControlDevice: DataControlDeviceV1<DataControlSource>,
-    DataControlManager: DataControlManagerV1<DataControlSource, DataControlDevice>,
->(
-    connection: &mut Connection<State<DataControlOffer, DataControlSource, DataControlDevice, DataControlManager>>,
-    data_control_manager: DataControlManager,
+fn set_clipboard<DataControl: DataControlV1>(
+    connection: &mut Connection<State<DataControl>>,
+    data_control_manager: DataControl::DataControlManager,
     seat_name: u32,
-    data_control_device: DataControlDevice,
-    selection_state: &mut SeatSelectionState<DataControlOffer>,
+    data_control_device: DataControl::DataControlDevice,
+    selection_state: &mut SeatSelectionState<DataControl>,
     selection_type: SelectionType,
     ordered_mime_types: Vec<Rc<Box<CStr>>>,
     data: HashMap<Rc<Box<CStr>>, Box<[u8]>>,
-) where
-    DataControlOfferEvent: FromEvent<<DataControlOffer as Proxy>::Event>,
-    DataControlSourceEvent: FromEvent<<DataControlSource as Proxy>::Event>,
-{
+) {
     let source = data_control_manager.create_data_source(connection);
     for mime_type in ordered_mime_types {
         // Some mime types might have gotten ignored due to errors.
