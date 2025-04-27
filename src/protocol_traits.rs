@@ -10,6 +10,7 @@ use wayrs_protocols::wlr_data_control_unstable_v1::*;
 
 use crate::logger::log_seat_target;
 
+/// Trait that references the types that are used by a clipboard protocol.
 pub(crate) trait DataControlV1: 'static {
     type DataControlOffer: DataControlOfferV1<Event: TryIntoGenericEvent<DataControlOfferEvent> + std::fmt::Debug>
         + std::fmt::Debug
@@ -30,8 +31,8 @@ pub(crate) trait DataControlV1: 'static {
         + 'static;
 }
 
+/// Types for the ext-data-control-v1 clipboard protocol.
 pub(crate) struct ExtDataControlV1;
-pub(crate) struct ZwlrDataControlV1;
 
 impl DataControlV1 for ExtDataControlV1 {
     type DataControlOffer = ExtDataControlOfferV1;
@@ -40,6 +41,9 @@ impl DataControlV1 for ExtDataControlV1 {
     type DataControlManager = ExtDataControlManagerV1;
 }
 
+/// Types for the wlr-data-control-unstable-v1 clipboard protocol.
+pub(crate) struct ZwlrDataControlV1;
+
 impl DataControlV1 for ZwlrDataControlV1 {
     type DataControlOffer = ZwlrDataControlOfferV1;
     type DataControlSource = ZwlrDataControlSourceV1;
@@ -47,6 +51,7 @@ impl DataControlV1 for ZwlrDataControlV1 {
     type DataControlManager = ZwlrDataControlManagerV1;
 }
 
+/// Interface for interacting with a data control offer.
 pub(crate) trait DataControlOfferV1: Clone + Copy + Send + Sync + Proxy {
     const TYPE_NAME: &'static str;
 
@@ -83,6 +88,7 @@ impl DataControlOfferV1 for ZwlrDataControlOfferV1 {
     }
 }
 
+/// Interface for interacting with a data control source.
 pub(crate) trait DataControlSourceV1: Clone + Copy + Send + Sync + Proxy {
     const TYPE_NAME: &'static str;
 
@@ -119,6 +125,7 @@ impl DataControlSourceV1 for ZwlrDataControlSourceV1 {
     }
 }
 
+/// Interface for interacting with a data control device.
 pub(crate) trait DataControlDeviceV1: Clone + Copy + Send + Sync + Proxy {
     const TYPE_NAME: &'static str;
 
@@ -173,6 +180,7 @@ impl DataControlDeviceV1 for ZwlrDataControlDeviceV1 {
     }
 }
 
+/// Interface for interacting with a data control manager.
 pub(crate) trait DataControlManagerV1: Clone + Copy + Send + Sync + Proxy {
     const TYPE_NAME: &'static str;
 
@@ -284,10 +292,15 @@ impl DataControlManagerV1 for ZwlrDataControlManagerV1 {
     }
 }
 
+/// An attempted conversion that consumes `self` and tries to output a generic event.
 pub(crate) trait TryIntoGenericEvent<GenericEvent> {
+    /// Performs the conversion.
+    ///
+    /// The seat name is used for logging in case of an unsuccessful conversion.
     fn try_into_generic_event(self, seat_name: u32) -> Option<GenericEvent>;
 }
 
+/// A generic wrapper for data control offer events.
 #[derive(Debug)]
 pub(crate) enum DataControlOfferEvent {
     Offer(CString),
@@ -327,6 +340,7 @@ impl TryIntoGenericEvent<DataControlOfferEvent> for zwlr_data_control_offer_v1::
     }
 }
 
+/// A generic wrapper for data control source events.
 #[derive(Debug)]
 pub(crate) enum DataControlSourceEvent {
     Send(ext_data_control_source_v1::SendArgs),
@@ -374,6 +388,7 @@ impl TryIntoGenericEvent<DataControlSourceEvent> for zwlr_data_control_source_v1
     }
 }
 
+/// A generic wrapper for data control device events.
 #[derive(Debug)]
 pub(crate) enum DataControlDeviceEvent<DataControlOffer: DataControlOfferV1> {
     DataOffer(DataControlOffer),
