@@ -5,25 +5,35 @@ use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::rc::Rc;
 
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use wayrs_client::global::{BindError, Global, GlobalExt as _};
 use wayrs_client::object::{ObjectId, Proxy};
 use wayrs_client::protocol::WlSeat;
 use wayrs_client::{ConnectError, Connection};
 
 use crate::logger;
-use crate::protocol_traits::{DataControlDeviceV1, DataControlManagerV1, DataControlOfferV1, DataControlV1};
+use crate::protocol_traits::{
+    DataControlDeviceV1, DataControlManagerV1, DataControlOfferV1, DataControlSourceV1, DataControlV1,
+};
 use crate::settings::Settings;
 use crate::wayland::data_control_device_cb;
+use crate::zeroize::ZeroizeSlice;
 
 #[derive(Debug)]
 pub(crate) enum WaylandError {
     ConnectError(ConnectError),
     IoError(std::io::Error),
+    NoDataControlManagerGlobalFound,
 }
 
 #[derive(Debug)]
-pub(crate) struct State<DataControl: DataControlV1> {
-    pub(crate) settings: Settings,
+pub(crate) struct State<'a, DataControl: DataControlV1> {
+    pub(crate) settings: &'a Settings,
+    /// Tracker of all current clipboard write tasks for all connections
+    pub(crate) task_tracker: &'a TaskTracker,
+    /// Token that can be used to cancel all clipboard write tasks for this connection
+    pub(crate) cancel_write_tasks_token: CancellationToken,
     pub(crate) data_control_manager: DataControl::DataControlManager,
     pub(crate) seats: HashMap<u32, Seat<DataControl>>,
 }
@@ -44,6 +54,12 @@ pub(crate) struct Seat<DataControl: DataControlV1> {
     pub(crate) got_new_regular_selection: bool,
     /// Used to check if we got a new primary selection during the roundtrip.
     pub(crate) got_new_primary_selection: bool,
+    /// Holds the data sources for the regular clipboard. We use a map to keep track of
+    /// non-destroyed data sources.
+    pub(crate) regular_data_sources: HashMap<ObjectId, DataControl::DataControlSource>,
+    /// Holds the data sources for the primary clipboard. We use a map to keep track of
+    /// non-destroyed data sources.
+    pub(crate) primary_data_sources: HashMap<ObjectId, DataControl::DataControlSource>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -87,6 +103,8 @@ impl<DataControl: DataControlV1> Seat<DataControl> {
             primary_selection: settings.clipboard_type.primary().then(SeatSelectionState::default),
             got_new_regular_selection: false,
             got_new_primary_selection: false,
+            regular_data_sources: HashMap::with_capacity(if settings.clipboard_type.regular() { 2 } else { 0 }),
+            primary_data_sources: HashMap::with_capacity(if settings.clipboard_type.primary() { 2 } else { 0 }),
         })
     }
 
@@ -100,25 +118,50 @@ impl<DataControl: DataControlV1> Seat<DataControl> {
         )))
     }
 
-    /// Iterates over mutable regular and primary selection data, with the selection offers also being present.
-    #[expect(clippy::type_complexity)]
-    pub(crate) fn selections_iter_mut_with_selection_offers(
+    /// Iterates over mutable regular and primary selection data, with the data sources also being present.
+    pub(crate) fn selections_iter_mut_with_sources(
         &mut self,
     ) -> impl Iterator<
         Item = (
             SelectionType,
             Option<&mut SeatSelectionState<DataControl>>,
+            &mut HashMap<ObjectId, DataControl::DataControlSource>,
+        ),
+    > {
+        std::iter::once((
+            SelectionType::Regular,
+            self.regular_selection.as_mut(),
+            &mut self.regular_data_sources,
+        ))
+        .chain(std::iter::once((
+            SelectionType::Primary,
+            self.primary_selection.as_mut(),
+            &mut self.primary_data_sources,
+        )))
+    }
+
+    /// Iterates over mutable regular and primary selection data, with the data sources and selection offers also being present.
+    #[expect(clippy::type_complexity)]
+    pub(crate) fn selections_iter_mut_with_sources_and_selection_offers(
+        &mut self,
+    ) -> impl Iterator<
+        Item = (
+            SelectionType,
+            Option<&mut SeatSelectionState<DataControl>>,
+            &mut HashMap<ObjectId, DataControl::DataControlSource>,
             &HashMap<ObjectId, Offer<DataControl::DataControlOffer>>,
         ),
     > {
         std::iter::once((
             SelectionType::Regular,
             self.regular_selection.as_mut(),
+            &mut self.regular_data_sources,
             &self.selection_offers,
         ))
         .chain(std::iter::once((
             SelectionType::Primary,
             self.primary_selection.as_mut(),
+            &mut self.primary_data_sources,
             &self.selection_offers,
         )))
     }
@@ -135,6 +178,14 @@ impl<DataControl: DataControlV1> Seat<DataControl> {
 
         if let Some(mut primary_selection) = self.primary_selection {
             primary_selection.destroy(conn);
+        }
+
+        for regular_source in self.regular_data_sources.into_values() {
+            regular_source.destroy(conn);
+        }
+
+        for primary_source in self.primary_data_sources.into_values() {
+            primary_source.destroy(conn);
         }
 
         self.data_control_device.destroy(conn);
@@ -170,7 +221,7 @@ impl<DataControlOffer: DataControlOfferV1> From<DataControlOffer> for Offer<Data
 pub(crate) struct MimeTypeAndPipe {
     pub(crate) mime_type: Rc<Box<CStr>>,
     pub(crate) pipe: tokio_pipe::PipeRead,
-    pub(crate) data_read: Option<Result<Vec<u8>, ReadToDataError>>,
+    pub(crate) data_read: Option<Result<ZeroizeSlice<Vec<u8>>, ReadToDataError>>,
     pub(crate) read_finished: bool,
 }
 
@@ -192,9 +243,10 @@ pub(crate) struct MimeTypesWithData<'a, DataControl: DataControlV1> {
     pub(crate) data_control_device: DataControl::DataControlDevice,
     pub(crate) selection_offers: &'a HashMap<ObjectId, Offer<DataControl::DataControlOffer>>,
     pub(crate) selection_state: &'a mut SeatSelectionState<DataControl>,
+    pub(crate) selection_sources: &'a mut HashMap<ObjectId, DataControl::DataControlSource>,
     pub(crate) selection_type: SelectionType,
     pub(crate) ordered_mime_types: Vec<Rc<Box<CStr>>>,
-    pub(crate) data: HashMap<Rc<Box<CStr>>, Box<[u8]>>,
+    pub(crate) data: HashMap<Rc<Box<CStr>>, ZeroizeSlice<Box<[u8]>>>,
 }
 
 /// Describes the current state of handling the selection event.
@@ -229,7 +281,7 @@ pub(crate) enum SeatSelectionState<DataControl: DataControlV1> {
     ///    => Therefore, if there is an offer whose selection type is unknown, we should wait before setting the clipboard
     GotData {
         ordered_mime_types: Vec<Rc<Box<CStr>>>,
-        data: HashMap<Rc<Box<CStr>>, Box<[u8]>>,
+        data: HashMap<Rc<Box<CStr>>, ZeroizeSlice<Box<[u8]>>>,
     },
     /// The selection was cleared.
     GotClear,
@@ -292,7 +344,11 @@ impl<DataControl: DataControlV1> SeatSelectionState<DataControl> {
     }
 
     /// Switches to the [`SeatSelectionState::GotData`] state.
-    pub(crate) fn got_data(&mut self, ordered_mime_types: Vec<Rc<Box<CStr>>>, data: HashMap<Rc<Box<CStr>>, Box<[u8]>>) {
+    pub(crate) fn got_data(
+        &mut self,
+        ordered_mime_types: Vec<Rc<Box<CStr>>>,
+        data: HashMap<Rc<Box<CStr>>, ZeroizeSlice<Box<[u8]>>>,
+    ) {
         let SeatSelectionState::GotPipes {
             ordered_mime_types: _, // This value will be empty because of std::mem::take
             pipes: _,

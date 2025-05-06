@@ -3,16 +3,21 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::ffi::CStr;
 use std::fs::File;
+use std::io::Cursor;
 use std::num::NonZeroU64;
 use std::ops::Deref;
 use std::os::fd::{IntoRawFd, OwnedFd};
 use std::os::unix::io::FromRawFd;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::StreamExt as _;
 use futures_util::stream::FuturesUnordered;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use wayrs_client::global::*;
 use wayrs_client::object::ObjectId;
 use wayrs_client::protocol::*;
@@ -30,9 +35,23 @@ use crate::protocol_traits::{
 };
 use crate::settings::Settings;
 use crate::states::*;
+use crate::zeroize::ZeroizeSlice;
 
-/// Runs the wayland client until a wayland error occurs.
-pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infallible, WaylandError> {
+/// The duration for which we will try to complete the clipboard write tasks
+/// after a shutdown request has been received.
+const SHUTDOWN_EXTRA_WRITE_TIME: Duration = Duration::from_millis(500);
+
+/// Indicates that the Wayland client got shutdown gracefully.
+pub(crate) struct GracefulWaylandShutdown;
+
+/// Runs the wayland client until a wayland error occurs or a shutdown request
+/// has been received resulting in a graceful shutdown.
+pub(crate) async fn run(
+    task_tracker: &TaskTracker,
+    shutdown_token: CancellationToken,
+    settings: &Settings,
+    is_reconnect: bool,
+) -> Result<GracefulWaylandShutdown, WaylandError> {
     let mut connection = Connection::<Infallible>::connect().map_err(WaylandError::ConnectError)?;
 
     if is_reconnect {
@@ -41,18 +60,27 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
         log::trace!(target: log_default_target(), "Connection to wayland server established");
     }
 
-    connection.async_roundtrip().await.map_err(WaylandError::IoError)?;
+    tokio::select! {
+        res = connection.async_roundtrip() => res.map_err(WaylandError::IoError)?,
+        () = shutdown_token.cancelled() => return Ok(GracefulWaylandShutdown),
+    };
 
     match connection.bind_singleton::<ExtDataControlManagerV1>(1) {
         Ok(ext_data_control_manager) => {
-            let connection = connection.clear_callbacks::<State<ExtDataControlV1>>();
+            let connection = connection.clear_callbacks::<State<'_, ExtDataControlV1>>();
             log::trace!(
                 target: log_default_target(),
                 "Using ext-data-control-v1 protocol"
             );
-            run_with_connection(connection, ext_data_control_manager, settings)
-                .await
-                .map_err(WaylandError::IoError)
+            run_until_shutdown_request(
+                task_tracker,
+                shutdown_token,
+                connection,
+                ext_data_control_manager,
+                settings,
+            )
+            .await
+            .map_err(WaylandError::IoError)
         }
         Err(_) => {
             let zwlr_data_control_manager_result = if settings.clipboard_type.primary() {
@@ -63,14 +91,20 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
 
             match zwlr_data_control_manager_result {
                 Ok(zwlr_data_control_manager) => {
-                    let connection = connection.clear_callbacks::<State<ZwlrDataControlV1>>();
+                    let connection = connection.clear_callbacks::<State<'_, ZwlrDataControlV1>>();
                     log::trace!(
                         target: log_default_target(),
                         "Using wlr-data-control-unstable-v1 protocol"
                     );
-                    run_with_connection(connection, zwlr_data_control_manager, settings)
-                        .await
-                        .map_err(WaylandError::IoError)
+                    run_until_shutdown_request(
+                        task_tracker,
+                        shutdown_token,
+                        connection,
+                        zwlr_data_control_manager,
+                        settings,
+                    )
+                    .await
+                    .map_err(WaylandError::IoError)
                 }
                 Err(err) => {
                     let mut default = "Failed to get clipboard manager.".to_string();
@@ -94,27 +128,46 @@ pub(crate) async fn run(settings: Settings, is_reconnect: bool) -> Result<Infall
                     }
 
                     log::error!(target: log_default_target(), "{}\nError: {}", default, err);
-                    std::process::exit(1);
+                    Err(WaylandError::NoDataControlManagerGlobalFound)
                 }
             }
         }
     }
 }
 
-/// Runs the wayland client until a wayland error occurs.
-async fn run_with_connection<DataControl: DataControlV1>(
-    mut connection: Connection<State<DataControl>>,
+/// Runs the Wayland client until a shutdown request has been received.
+async fn run_until_shutdown_request<'a, DataControl: DataControlV1>(
+    task_tracker: &'a TaskTracker,
+    shutdown_token: CancellationToken,
+    mut connection: Connection<State<'a, DataControl>>,
     data_control_manager: DataControl::DataControlManager,
-    settings: Settings,
-) -> Result<Infallible, std::io::Error> {
+    settings: &'a Settings,
+) -> Result<GracefulWaylandShutdown, std::io::Error> {
     let mut state = State {
         settings,
+        task_tracker,
+        cancel_write_tasks_token: shutdown_token.child_token(),
         data_control_manager,
         seats: HashMap::with_capacity(4),
     };
 
+    tokio::select! {
+        wayland_result = run_with_connection(&mut connection, &mut state) => {
+            match wayland_result {
+                Err(err) => Err(err)
+            }
+        }
+        () = shutdown_token.cancelled_owned() => Ok(GracefulWaylandShutdown)
+    }
+}
+
+/// Runs the wayland client until a wayland error occurs.
+async fn run_with_connection<'a, DataControl: DataControlV1>(
+    connection: &mut Connection<State<'a, DataControl>>,
+    state: &mut State<'a, DataControl>,
+) -> Result<Infallible, std::io::Error> {
     connection.add_registry_cb(wl_registry_cb);
-    connection.dispatch_events(&mut state);
+    connection.dispatch_events(state);
 
     if state.seats.is_empty() {
         log::warn!(target: log_default_target(), "No seats found on startup");
@@ -132,8 +185,8 @@ async fn run_with_connection<DataControl: DataControlV1>(
                 let seat_name = seat.seat_name;
                 let data_control_device = seat.data_control_device;
 
-                for (selection_type, selection_state, selection_offers) in
-                    seat.selections_iter_mut_with_selection_offers()
+                for (selection_type, selection_state, selection_sources, selection_offers) in
+                    seat.selections_iter_mut_with_sources_and_selection_offers()
                 {
                     let Some(selection_state) = selection_state else {
                         continue;
@@ -154,6 +207,7 @@ async fn run_with_connection<DataControl: DataControlV1>(
                         selection_offers,
                         selection_type,
                         selection_state,
+                        selection_sources,
                         state.settings.selection_size_limit_bytes,
                         state.settings.ignore_selection_event_on_error,
                     ));
@@ -175,11 +229,12 @@ async fn run_with_connection<DataControl: DataControlV1>(
                         Some(Ok(mime_types_with_data)) => {
                             if mime_types_with_data.selection_offers.is_empty() {
                                 set_clipboard(
-                                    &mut connection,
-                                    data_control_manager,
+                                    connection,
+                                    state.data_control_manager,
                                     mime_types_with_data.seat_name,
                                     mime_types_with_data.data_control_device,
                                     mime_types_with_data.selection_state,
+                                    mime_types_with_data.selection_sources,
                                     mime_types_with_data.selection_type,
                                     mime_types_with_data.ordered_mime_types,
                                     mime_types_with_data.data,
@@ -195,7 +250,7 @@ async fn run_with_connection<DataControl: DataControlV1>(
                         }
                         Some(Err(selection_state)) => {
                             // Selection event got ignored
-                            selection_state.reset(&mut connection);
+                            selection_state.reset(connection);
                         }
                         None => unreachable!(),
                     }
@@ -204,8 +259,8 @@ async fn run_with_connection<DataControl: DataControlV1>(
         };
 
         if received_wayland_events {
-            connection.dispatch_events(&mut state);
-            handle_new_selection_state(&mut connection, &mut state).await?;
+            connection.dispatch_events(state);
+            handle_new_selection_state(connection, state).await?;
 
             // Now that we received and dispatched new wayland events, check if we can set the clipboard now.
             // Also notice, we do this before the async flush.
@@ -218,7 +273,7 @@ async fn run_with_connection<DataControl: DataControlV1>(
                 let seat_name = seat.seat_name;
                 let data_control_device = seat.data_control_device;
 
-                for (selection_type, selection_state) in seat.selections_iter_mut() {
+                for (selection_type, selection_state, selection_sources) in seat.selections_iter_mut_with_sources() {
                     let Some(selection_state) = selection_state else {
                         continue;
                     };
@@ -235,11 +290,12 @@ async fn run_with_connection<DataControl: DataControlV1>(
                     let owned_data = std::mem::take(data);
 
                     set_clipboard(
-                        &mut connection,
-                        data_control_manager,
+                        connection,
+                        state.data_control_manager,
                         seat_name,
                         data_control_device,
                         selection_state,
+                        selection_sources,
                         selection_type,
                         owned_ordered_mime_types,
                         owned_data,
@@ -260,7 +316,7 @@ fn wl_registry_cb<DataControl: DataControlV1>(
 ) {
     match event {
         wl_registry::Event::Global(global) if global.is::<WlSeat>() => {
-            match Seat::bind(connection, state.data_control_manager, global, &state.settings) {
+            match Seat::bind(connection, state.data_control_manager, global, state.settings) {
                 Ok(seat) => {
                     if let Some(old_seat) = state.seats.insert(global.name, seat) {
                         old_seat.destroy(connection);
@@ -371,7 +427,7 @@ pub(crate) fn data_control_device_cb<DataControl: DataControlV1>(
                 }
 
                 if let Some(offer) = maybe_offer {
-                    if should_ignore_offer(&event_context.state.settings, seat_name, SelectionType::Regular, &offer) {
+                    if should_ignore_offer(event_context.state.settings, seat_name, SelectionType::Regular, &offer) {
                         regular_selection.got_ignored_event(event_context.conn);
                         offer.data_control_offer.destroy(event_context.conn);
                         return;
@@ -426,7 +482,7 @@ pub(crate) fn data_control_device_cb<DataControl: DataControlV1>(
                 }
 
                 if let Some(offer) = maybe_offer {
-                    if should_ignore_offer(&event_context.state.settings, seat_name, SelectionType::Primary, &offer) {
+                    if should_ignore_offer(event_context.state.settings, seat_name, SelectionType::Primary, &offer) {
                         primary_selection.got_ignored_event(event_context.conn);
                         offer.data_control_offer.destroy(event_context.conn);
                         return;
@@ -745,9 +801,9 @@ fn create_pipes_for_mime_types<DataControl: DataControlV1>(
 /// # Errors
 ///
 /// Only Wayland errors are returned.
-async fn handle_new_selection_state<DataControl: DataControlV1>(
-    connection: &mut Connection<State<DataControl>>,
-    state: &mut State<DataControl>,
+async fn handle_new_selection_state<'a, DataControl: DataControlV1>(
+    connection: &mut Connection<State<'a, DataControl>>,
+    state: &mut State<'a, DataControl>,
 ) -> std::io::Result<()> {
     'handle_new_selection_state: loop {
         let selection_pipes = state
@@ -917,7 +973,7 @@ async fn read_pipe_to_data<'a>(
     size_limit: Option<NonZeroU64>,
 ) -> PipeDataResult<'a> {
     if mime_type_and_pipe.data_read.is_none() {
-        mime_type_and_pipe.data_read = Some(Ok(Vec::with_capacity(32)));
+        mime_type_and_pipe.data_read = Some(Ok(ZeroizeSlice::new(Vec::with_capacity(32))));
     } else if mime_type_and_pipe.read_finished || matches!(mime_type_and_pipe.data_read, Some(Err(_))) {
         unreachable!();
     };
@@ -1059,12 +1115,14 @@ async fn read_pipes_to_data(
 /// If this function returns [`Ok`], the value in
 /// [`SeatSelectionState::GotPipes::ordered_mime_types`]
 /// has been replaced with an empty [`Vec`].
+#[expect(clippy::too_many_arguments)]
 async fn handle_pipes_selection_state<'a, DataControl: DataControlV1>(
     seat_name: u32,
     data_control_device: DataControl::DataControlDevice,
     selection_offers: &'a HashMap<ObjectId, Offer<DataControl::DataControlOffer>>,
     selection_type: SelectionType,
     selection_state: &'a mut SeatSelectionState<DataControl>,
+    selection_sources: &'a mut HashMap<ObjectId, DataControl::DataControlSource>,
     size_limit: Option<NonZeroU64>,
     ignore_selection_event_on_error: bool,
 ) -> Result<MimeTypesWithData<'a, DataControl>, &'a mut SeatSelectionState<DataControl>> {
@@ -1139,6 +1197,7 @@ async fn handle_pipes_selection_state<'a, DataControl: DataControlV1>(
         data_control_device,
         selection_offers,
         selection_state,
+        selection_sources,
         selection_type,
         ordered_mime_types: owned_ordered_mime_types,
         data,
@@ -1146,11 +1205,12 @@ async fn handle_pipes_selection_state<'a, DataControl: DataControlV1>(
 }
 
 /// Handles clipboard data requests.
+#[expect(clippy::type_complexity)]
 fn data_source_cb<DataControl: DataControlV1>(
     seat_name: u32,
     selection_type: SelectionType,
     event_context: EventCtx<State<DataControl>, DataControl::DataControlSource>,
-    data_map: &Arc<HashMap<Box<CStr>, Box<[u8]>>>,
+    data_map: &Arc<HashMap<Box<CStr>, ZeroizeSlice<Box<[u8]>>>>,
 ) {
     match event_context.event.try_into_generic_event(seat_name) {
         Some(DataControlSourceEvent::Send(send)) => {
@@ -1237,39 +1297,67 @@ fn data_source_cb<DataControl: DataControlV1>(
                     return;
                 }
             };
+
+            let cancel_task_token = event_context.state.cancel_write_tasks_token.clone();
             let write_timeout = event_context.state.settings.write_timeout;
 
-            tokio::spawn(async move {
-                let data = data_map_clone.get(send.mime_type.as_c_str()).unwrap().deref();
+            event_context.state.task_tracker.spawn(async move {
+                let mut data = Cursor::new(data_map_clone.get(send.mime_type.as_c_str()).unwrap().deref().deref());
 
-                enum TimeoutResult {
+                enum WriteResult {
                     Ok,
                     IoError(std::io::Error),
                     Timeout,
+                    ReceivedShutdownRequest,
                 }
 
-                let write_result = tokio::select! {
-                    biased;
-
-                    res = write_handle.write_all(data) => {
+                let write_until = Instant::now() + write_timeout;
+                let mut write_result = tokio::select! {
+                    res = write_handle.write_all_buf(&mut data) => {
                         match res {
-                            Ok(()) => TimeoutResult::Ok,
-                            Err(err) => TimeoutResult::IoError(err),
+                            Ok(()) => WriteResult::Ok,
+                            Err(err) => WriteResult::IoError(err),
                         }
                     }
-                    _ = tokio::time::sleep(write_timeout) => {
-                        TimeoutResult::Timeout
+                    () = tokio::time::sleep_until(write_until) => {
+                        WriteResult::Timeout
                     }
+                    () = cancel_task_token.cancelled_owned() => {
+                        WriteResult::ReceivedShutdownRequest
+                    }
+                };
+
+                // Extra time to write rest of data in case of shutdown request
+                write_result = match write_result {
+                    WriteResult::Ok => write_result,
+                    WriteResult::IoError(_) => write_result,
+                    WriteResult::Timeout => write_result,
+                    WriteResult::ReceivedShutdownRequest => {
+                        tokio::select! {
+                            res = write_handle.write_all_buf(&mut data) => {
+                                match res {
+                                    Ok(()) => WriteResult::Ok,
+                                    Err(err) => WriteResult::IoError(err),
+                                }
+                            }
+                            () = tokio::time::sleep_until(write_until) => {
+                                WriteResult::Timeout
+                            }
+                            () = tokio::time::sleep(SHUTDOWN_EXTRA_WRITE_TIME) => {
+                                WriteResult::ReceivedShutdownRequest
+                            }
+                        }
+                    },
                 };
 
                 drop(write_handle); // Explicitly close file descriptor
                 drop(data_map_clone);
 
                 match write_result {
-                    TimeoutResult::Ok => {
+                    WriteResult::Ok => {
                         // Since FdWrite uses libc::write directly, there is no need for flushing
                     }
-                    TimeoutResult::IoError(err) => {
+                    WriteResult::IoError(err) => {
                         log::warn!(
                             target: &log_seat_target(seat_name),
                             "{} clipboard data source {}: failed to write clipboard data for mime type {:?}: {}",
@@ -1279,10 +1367,19 @@ fn data_source_cb<DataControl: DataControlV1>(
                             err,
                         );
                     }
-                    TimeoutResult::Timeout => {
+                    WriteResult::Timeout => {
                         log::debug!(
                             target: &log_seat_target(seat_name),
                             "{} clipboard data source {}: failed to write clipboard data for mime type {:?}: timed out",
+                            selection_type.get_clipboard_type_str(true),
+                            event_context.proxy.id().as_u32(),
+                            send.mime_type,
+                        );
+                    }
+                    WriteResult::ReceivedShutdownRequest => {
+                        log::debug!(
+                            target: &log_seat_target(seat_name),
+                            "{} clipboard data source {}: failed to write clipboard data for mime type {:?}: write task got cancelled",
                             selection_type.get_clipboard_type_str(true),
                             event_context.proxy.id().as_u32(),
                             send.mime_type,
@@ -1292,14 +1389,39 @@ fn data_source_cb<DataControl: DataControlV1>(
             });
         }
         Some(DataControlSourceEvent::Cancelled) => {
-            event_context.proxy.destroy(event_context.conn);
+            // Check if data control source has not been destroyed yet
+            let got_destroyed = if let Some(seat) = event_context.state.seats.get_mut(&seat_name) {
+                let data_sources = match selection_type {
+                    SelectionType::Regular => &mut seat.regular_data_sources,
+                    SelectionType::Primary => &mut seat.primary_data_sources,
+                };
 
-            log::trace!(
-                target: &log_seat_target(seat_name),
-                "{} clipboard data source {}: received cancelled event and destroyed clipboard data source",
-                selection_type.get_clipboard_type_str(true),
-                event_context.proxy.id().as_u32(),
-            );
+                if data_sources.remove(&event_context.proxy.id()).is_some() {
+                    // Not yet destroyed, so do it now
+                    event_context.proxy.destroy(event_context.conn);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if got_destroyed {
+                log::trace!(
+                    target: &log_seat_target(seat_name),
+                    "{} clipboard data source {}: received cancelled event and destroyed clipboard data source",
+                    selection_type.get_clipboard_type_str(true),
+                    event_context.proxy.id().as_u32(),
+                );
+            } else {
+                log::trace!(
+                    target: &log_seat_target(seat_name),
+                    "{} clipboard data source {}: received cancelled event and skipped destruction of clipboard data source",
+                    selection_type.get_clipboard_type_str(true),
+                    event_context.proxy.id().as_u32(),
+                );
+            }
         }
         None => {}
     }
@@ -1313,9 +1435,10 @@ fn set_clipboard<DataControl: DataControlV1>(
     seat_name: u32,
     data_control_device: DataControl::DataControlDevice,
     selection_state: &mut SeatSelectionState<DataControl>,
+    selection_sources: &mut HashMap<ObjectId, DataControl::DataControlSource>,
     selection_type: SelectionType,
     ordered_mime_types: Vec<Rc<Box<CStr>>>,
-    data: HashMap<Rc<Box<CStr>>, Box<[u8]>>,
+    data: HashMap<Rc<Box<CStr>>, ZeroizeSlice<Box<[u8]>>>,
 ) {
     let source = data_control_manager.create_data_source(connection);
     for mime_type in ordered_mime_types {
@@ -1339,6 +1462,14 @@ fn set_clipboard<DataControl: DataControlV1>(
     });
 
     let source_id = source.id().as_u32();
+
+    if let Some(old_selection_source) = selection_sources.insert(source.id(), source) {
+        old_selection_source.destroy(connection);
+        log::error!(
+            target: &log_seat_target(seat_name),
+            "Created data control source, even though data control source with same id was already present"
+        );
+    }
 
     match selection_type {
         SelectionType::Regular => data_control_device.set_selection(connection, Some(source)),

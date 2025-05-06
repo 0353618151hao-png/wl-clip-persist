@@ -2,26 +2,58 @@ mod async_io;
 mod logger;
 mod protocol_traits;
 mod settings;
+mod signal;
 mod states;
 mod wayland;
+mod zeroize;
 
 use std::time::Duration;
 
-use settings::NumberOrInf;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::logger::log_default_target;
-use crate::settings::get_settings;
+use crate::settings::{NumberOrInf, Settings, get_settings};
+use crate::signal::shutdown_token;
 use crate::states::WaylandError;
+use crate::wayland::GracefulWaylandShutdown;
+
+/// The exit code
+struct ExitCode(i32);
 
 // One worker thread for writing the clipboard data
 #[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 async fn main() {
-    let settings = get_settings();
+    // Explicit scope to drop values before exit call
+    let exit_code = {
+        let settings = get_settings();
+        let task_tracker = TaskTracker::new();
+        let shutdown_token = shutdown_token();
+
+        let exit_code = run(settings, &task_tracker, shutdown_token.child_token()).await;
+
+        // Manually cancel all clipboard write tasks in case no shutdown request was received,
+        // but an error occurred
+        shutdown_token.cancel();
+
+        // Wait until all clipboard write tasks have been finished
+        task_tracker.close();
+        task_tracker.wait().await;
+
+        exit_code
+    };
+
+    std::process::exit(exit_code.0);
+}
+
+async fn run(settings: Settings, task_tracker: &TaskTracker, shutdown_token: CancellationToken) -> ExitCode {
     let mut is_reconnect = false;
     let mut connection_tries = 0;
 
     loop {
-        match wayland::run(settings.clone(), is_reconnect).await {
+        match wayland::run(task_tracker, shutdown_token.child_token(), &settings, is_reconnect).await {
+            Ok(GracefulWaylandShutdown) => return ExitCode(0),
+            Err(WaylandError::NoDataControlManagerGlobalFound) => return ExitCode(1),
             Err(WaylandError::ConnectError(err)) => {
                 if is_reconnect {
                     if matches!(settings.reconnect_tries, NumberOrInf::Number(_)) {
@@ -34,7 +66,7 @@ async fn main() {
                             "Wayland connect error: {}",
                             err,
                         );
-                        std::process::exit(1);
+                        return ExitCode(1);
                     } else if settings.reconnect_delay == Duration::ZERO {
                         match settings.reconnect_tries {
                             NumberOrInf::Number(reconnect_tries) => {
@@ -76,7 +108,10 @@ async fn main() {
                             }
                         }
 
-                        tokio::time::sleep(settings.reconnect_delay).await;
+                        tokio::select! {
+                            () = tokio::time::sleep(settings.reconnect_delay) => {},
+                            () = shutdown_token.cancelled() => return ExitCode(0),
+                        }
                     }
                 } else {
                     log::error!(
@@ -84,7 +119,7 @@ async fn main() {
                         "Failed to connect to wayland server: {}",
                         err,
                     );
-                    std::process::exit(1);
+                    return ExitCode(1);
                 }
             }
             Err(WaylandError::IoError(err)) => {
@@ -116,7 +151,7 @@ async fn main() {
                         "Wayland IO error: {}",
                         err,
                     );
-                    std::process::exit(1);
+                    return ExitCode(1);
                 }
             }
         }
