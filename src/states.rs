@@ -25,6 +25,7 @@ pub(crate) enum WaylandError {
     ConnectError(ConnectError),
     IoError(std::io::Error),
     NoDataControlManagerGlobalFound,
+    DataControlManagerGlobalRemoved,
 }
 
 #[derive(Debug)]
@@ -36,6 +37,9 @@ pub(crate) struct State<'a, DataControl: DataControlV1> {
     pub(crate) cancel_write_tasks_token: CancellationToken,
     pub(crate) data_control_manager: DataControl::DataControlManager,
     pub(crate) seats: HashMap<u32, Seat<DataControl>>,
+    /// Should basically never happen, but tracks whether the data control manager global
+    /// was removed during event dispatch
+    pub(crate) removed_data_control_manager: bool,
 }
 
 #[derive(Debug)]

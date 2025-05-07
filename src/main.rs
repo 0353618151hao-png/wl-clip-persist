@@ -154,6 +154,35 @@ async fn run(settings: Settings, task_tracker: &TaskTracker, shutdown_token: Can
                     return ExitCode(1);
                 }
             }
+            Err(WaylandError::DataControlManagerGlobalRemoved) => {
+                if matches!(settings.reconnect_tries, NumberOrInf::Inf | NumberOrInf::Number(1..)) {
+                    is_reconnect = true;
+                    connection_tries = 0;
+
+                    match settings.reconnect_tries {
+                        NumberOrInf::Number(reconnect_tries) => {
+                            log::error!(
+                                target: log_default_target(),
+                                "Wayland error: data control manager global was removed\nAttempt {}/{} to reconnect will start immediately...",
+                                connection_tries + 1,
+                                reconnect_tries,
+                            );
+                        }
+                        NumberOrInf::Inf => {
+                            log::error!(
+                                target: log_default_target(),
+                                "Wayland error: data control manager global was removed\nAttempt to reconnect will start immediately...",
+                            );
+                        }
+                    }
+                } else {
+                    log::error!(
+                        target: log_default_target(),
+                        "Wayland error: data control manager global was removed",
+                    );
+                    return ExitCode(1);
+                }
+            }
         }
     }
 }

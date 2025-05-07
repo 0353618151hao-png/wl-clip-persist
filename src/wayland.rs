@@ -80,7 +80,6 @@ pub(crate) async fn run(
                 settings,
             )
             .await
-            .map_err(WaylandError::IoError)
         }
         Err(_) => {
             let zwlr_data_control_manager_result = if settings.clipboard_type.primary() {
@@ -104,7 +103,6 @@ pub(crate) async fn run(
                         settings,
                     )
                     .await
-                    .map_err(WaylandError::IoError)
                 }
                 Err(err) => {
                     let mut default = "Failed to get clipboard manager.".to_string();
@@ -142,13 +140,14 @@ async fn run_until_shutdown_request<'a, DataControl: DataControlV1>(
     mut connection: Connection<State<'a, DataControl>>,
     data_control_manager: DataControl::DataControlManager,
     settings: &'a Settings,
-) -> Result<GracefulWaylandShutdown, std::io::Error> {
+) -> Result<GracefulWaylandShutdown, WaylandError> {
     let mut state = State {
         settings,
         task_tracker,
         cancel_write_tasks_token: shutdown_token.child_token(),
         data_control_manager,
         seats: HashMap::with_capacity(4),
+        removed_data_control_manager: false,
     };
 
     tokio::select! {
@@ -165,16 +164,20 @@ async fn run_until_shutdown_request<'a, DataControl: DataControlV1>(
 async fn run_with_connection<'a, DataControl: DataControlV1>(
     connection: &mut Connection<State<'a, DataControl>>,
     state: &mut State<'a, DataControl>,
-) -> Result<Infallible, std::io::Error> {
+) -> Result<Infallible, WaylandError> {
     connection.add_registry_cb(wl_registry_cb);
     connection.dispatch_events(state);
+
+    if state.removed_data_control_manager {
+        return Err(WaylandError::DataControlManagerGlobalRemoved);
+    }
 
     if state.seats.is_empty() {
         log::warn!(target: log_default_target(), "No seats found on startup");
     }
 
     // Advertise the bindings to the wayland server
-    connection.async_flush().await?;
+    connection.async_flush().await.map_err(WaylandError::IoError)?;
 
     loop {
         let received_wayland_events = 'wait: loop {
@@ -218,7 +221,7 @@ async fn run_with_connection<'a, DataControl: DataControlV1>(
                 biased;
 
                 recv_events = connection.async_recv_events() => {
-                    recv_events?;
+                    recv_events.map_err(WaylandError::IoError)?;
                     drop(set_clipboard_futures);
                     break 'wait true;
                 }
@@ -260,6 +263,11 @@ async fn run_with_connection<'a, DataControl: DataControlV1>(
 
         if received_wayland_events {
             connection.dispatch_events(state);
+
+            if state.removed_data_control_manager {
+                return Err(WaylandError::DataControlManagerGlobalRemoved);
+            }
+
             handle_new_selection_state(connection, state).await?;
 
             // Now that we received and dispatched new wayland events, check if we can set the clipboard now.
@@ -304,7 +312,7 @@ async fn run_with_connection<'a, DataControl: DataControlV1>(
             }
         }
 
-        connection.async_flush().await?;
+        connection.async_flush().await.map_err(WaylandError::IoError)?;
     }
 }
 
@@ -347,6 +355,8 @@ fn wl_registry_cb<DataControl: DataControlV1>(
             if let Some(seat) = state.seats.remove(name) {
                 seat.destroy(connection);
                 log::trace!(target: &log_seat_target(*name), "Removed seat");
+            } else if *name == state.data_control_manager.id().as_u32() {
+                state.removed_data_control_manager = true;
             }
         }
     }
@@ -804,7 +814,7 @@ fn create_pipes_for_mime_types<DataControl: DataControlV1>(
 async fn handle_new_selection_state<'a, DataControl: DataControlV1>(
     connection: &mut Connection<State<'a, DataControl>>,
     state: &mut State<'a, DataControl>,
-) -> std::io::Result<()> {
+) -> Result<(), WaylandError> {
     'handle_new_selection_state: loop {
         let selection_pipes = state
             .seats
@@ -879,8 +889,12 @@ async fn handle_new_selection_state<'a, DataControl: DataControlV1>(
         }
 
         // We need a roundtrip to know if these pipes are from ourselves
-        connection.async_roundtrip().await?;
+        connection.async_roundtrip().await.map_err(WaylandError::IoError)?;
         connection.dispatch_events(state);
+
+        if state.removed_data_control_manager {
+            return Err(WaylandError::DataControlManagerGlobalRemoved);
+        }
 
         // We have to check all seats, because `selection_pipes` might not cover every seat.
         // If there is a new offer in an unchecked seat, we should handle it in the next loop!
