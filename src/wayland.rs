@@ -33,7 +33,7 @@ use crate::protocol_traits::{
     DataControlSourceEvent, DataControlSourceV1, DataControlV1, ExtDataControlV1, TryIntoGenericEvent as _,
     ZwlrDataControlV1,
 };
-use crate::settings::Settings;
+use crate::settings::{ClipboardProtocol, Settings};
 use crate::states::*;
 use crate::zeroize::ZeroizeSlice;
 
@@ -65,13 +65,41 @@ pub(crate) async fn run(
         () = shutdown_token.cancelled() => return Ok(GracefulWaylandShutdown),
     };
 
+    match settings.force_protocol {
+        Some(ClipboardProtocol::ExtDataControlV1) => {
+            run_with_ext_protocol(task_tracker, shutdown_token, connection, settings, true).await
+        }
+        Some(ClipboardProtocol::WlrDataControlUnstableV1) => {
+            run_with_wlr_protocol(task_tracker, shutdown_token, connection, settings, true).await
+        }
+        None => run_with_ext_protocol(task_tracker, shutdown_token, connection, settings, false).await,
+    }
+}
+
+/// If `forced` is true, runs the Wayland client using the ext-data-control-v1 protocol until a shutdown
+/// request has been received. Otherwise, we try the ext-data-control-v1 first, and fallback to the
+/// wlr-data-control-unstable-v1 protocol if the ext-data-control-v1 is unsupported.
+async fn run_with_ext_protocol<'a>(
+    task_tracker: &'a TaskTracker,
+    shutdown_token: CancellationToken,
+    mut connection: Connection<Infallible>,
+    settings: &'a Settings,
+    forced: bool,
+) -> Result<GracefulWaylandShutdown, WaylandError> {
     match connection.bind_singleton::<ExtDataControlManagerV1>(1) {
         Ok(ext_data_control_manager) => {
             let connection = connection.clear_callbacks::<State<'_, ExtDataControlV1>>();
-            log::trace!(
-                target: log_default_target(),
-                "Using ext-data-control-v1 protocol"
-            );
+            if forced {
+                log::trace!(
+                    target: log_default_target(),
+                    "Using ext-data-control-v1 protocol (forced)"
+                );
+            } else {
+                log::trace!(
+                    target: log_default_target(),
+                    "Using ext-data-control-v1 protocol"
+                );
+            }
             run_until_shutdown_request(
                 task_tracker,
                 shutdown_token,
@@ -81,54 +109,103 @@ pub(crate) async fn run(
             )
             .await
         }
-        Err(_) => {
-            let zwlr_data_control_manager_result = if settings.clipboard_type.primary() {
-                connection.bind_singleton::<ZwlrDataControlManagerV1>(2)
-            } else {
-                connection.bind_singleton::<ZwlrDataControlManagerV1>(1..=2)
-            };
+        Err(err) => {
+            if forced {
+                let mut default = "Failed to get clipboard manager.".to_string();
 
-            match zwlr_data_control_manager_result {
-                Ok(zwlr_data_control_manager) => {
-                    let connection = connection.clear_callbacks::<State<'_, ZwlrDataControlV1>>();
-                    log::trace!(
-                        target: log_default_target(),
-                        "Using wlr-data-control-unstable-v1 protocol"
-                    );
-                    run_until_shutdown_request(
-                        task_tracker,
-                        shutdown_token,
-                        connection,
-                        zwlr_data_control_manager,
-                        settings,
-                    )
-                    .await
-                }
-                Err(err) => {
-                    let mut default = "Failed to get clipboard manager.".to_string();
-
-                    match err {
-                        BindError::UnsupportedVersion { actual: 1, min: _ } if settings.clipboard_type.primary() => {
-                            default += "\nPerhaps the primary clipboard is not supported by your compositor?\nTry to run this program with --clipboard regular.";
-                        }
-                        BindError::UnsupportedVersion { actual: _, min: _ } => {}
-                        BindError::IncorrectInterface {
-                            actual: _,
-                            requested: _,
-                        } => {}
-                        BindError::GlobalNotFound(_) => {
-                            default += concat!(
-                                "\nEither your compositor does neither support the ext-data-control-v1 nor wlr-data-control-unstable-v1 Wayland protocol, and is thus unsupported, or ",
-                                clap::crate_name!(),
-                                " has not been run as a privileged client."
-                            );
-                        }
+                match err {
+                    BindError::UnsupportedVersion { actual: _, min: _ } => {}
+                    BindError::IncorrectInterface {
+                        actual: _,
+                        requested: _,
+                    } => {}
+                    BindError::GlobalNotFound(_) => {
+                        default += concat!(
+                            "\nEither your compositor does not support the ext-data-control-v1 Wayland protocol, or ",
+                            clap::crate_name!(),
+                            " has not been run as a privileged client."
+                        );
                     }
+                }
 
-                    log::error!(target: log_default_target(), "{}\nError: {}", default, err);
-                    Err(WaylandError::NoDataControlManagerGlobalFound)
+                log::error!(target: log_default_target(), "{}\nError: {}", default, err);
+                Err(WaylandError::NoDataControlManagerGlobalFound)
+            } else {
+                run_with_wlr_protocol(task_tracker, shutdown_token, connection, settings, false).await
+            }
+        }
+    }
+}
+
+/// Runs the Wayland client using the wlr-data-control-unstable-v1 protocol until a shutdown
+/// request has been received.
+async fn run_with_wlr_protocol<'a>(
+    task_tracker: &'a TaskTracker,
+    shutdown_token: CancellationToken,
+    mut connection: Connection<Infallible>,
+    settings: &'a Settings,
+    forced: bool,
+) -> Result<GracefulWaylandShutdown, WaylandError> {
+    let zwlr_data_control_manager_result = if settings.clipboard_type.primary() {
+        connection.bind_singleton::<ZwlrDataControlManagerV1>(2)
+    } else {
+        connection.bind_singleton::<ZwlrDataControlManagerV1>(1..=2)
+    };
+
+    match zwlr_data_control_manager_result {
+        Ok(zwlr_data_control_manager) => {
+            let connection = connection.clear_callbacks::<State<'_, ZwlrDataControlV1>>();
+            if forced {
+                log::trace!(
+                    target: log_default_target(),
+                    "Using wlr-data-control-unstable-v1 protocol (forced)"
+                );
+            } else {
+                log::trace!(
+                    target: log_default_target(),
+                    "Using wlr-data-control-unstable-v1 protocol"
+                );
+            }
+            run_until_shutdown_request(
+                task_tracker,
+                shutdown_token,
+                connection,
+                zwlr_data_control_manager,
+                settings,
+            )
+            .await
+        }
+        Err(err) => {
+            let mut default = "Failed to get clipboard manager.".to_string();
+
+            match err {
+                BindError::UnsupportedVersion { actual: 1, min: _ } if settings.clipboard_type.primary() => {
+                    default += "\nPerhaps the primary clipboard is not supported by your compositor?\nTry to run this program with --clipboard regular.";
+                }
+                BindError::UnsupportedVersion { actual: _, min: _ } => {}
+                BindError::IncorrectInterface {
+                    actual: _,
+                    requested: _,
+                } => {}
+                BindError::GlobalNotFound(_) => {
+                    if forced {
+                        default += concat!(
+                            "\nEither your compositor does not support the wlr-data-control-unstable-v1 Wayland protocol, or ",
+                            clap::crate_name!(),
+                            " has not been run as a privileged client."
+                        );
+                    } else {
+                        default += concat!(
+                            "\nEither your compositor does neither support the ext-data-control-v1 nor wlr-data-control-unstable-v1 Wayland protocol, and is thus unsupported, or ",
+                            clap::crate_name!(),
+                            " has not been run as a privileged client."
+                        );
+                    }
                 }
             }
+
+            log::error!(target: log_default_target(), "{}\nError: {}", default, err);
+            Err(WaylandError::NoDataControlManagerGlobalFound)
         }
     }
 }
