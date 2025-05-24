@@ -27,7 +27,7 @@ use wayrs_protocols::ext_data_control_v1::ExtDataControlManagerV1;
 use wayrs_protocols::wlr_data_control_unstable_v1::ZwlrDataControlManagerV1;
 
 use crate::async_io::FdWrite;
-use crate::logger::{log_default_target, log_seat_target};
+use crate::logger::{log_default_target, log_seat_target, log_text_data};
 use crate::protocol_traits::{
     DataControlDeviceEvent, DataControlDeviceV1, DataControlManagerV1, DataControlOfferEvent, DataControlOfferV1,
     DataControlSourceEvent, DataControlSourceV1, DataControlV1, ExtDataControlV1, TryIntoGenericEvent as _,
@@ -307,6 +307,10 @@ async fn run_with_connection<'a, DataControl: DataControlV1>(
 
                     match mime_types_with_data {
                         Some(Ok(mime_types_with_data)) => {
+                            if log::log_enabled!(target: &log_seat_target(mime_types_with_data.seat_name), log::Level::Trace) {
+                                log_text_data(&mime_types_with_data);
+                            }
+
                             if mime_types_with_data.selection_offers.is_empty() {
                                 set_clipboard(
                                     connection,

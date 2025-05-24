@@ -111,6 +111,7 @@ You can modify the log level to see more of what is going on, e.g.
 ```
 RUST_LOG=trace wl-clip-persist --clipboard regular
 ```
+Please be aware that this will show the first ~30 bytes of your text clipboard contents whenever you copy something. So, when you create an issue with the full log, either do not copy sensitive data to your clipboard or censor it.
 
 ## Troubleshooting
 ### Primary selection mode breaks the selection system ([#3](https://github.com/Linus789/wl-clip-persist/issues/3))

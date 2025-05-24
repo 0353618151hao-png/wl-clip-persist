@@ -1,7 +1,12 @@
+use std::ffi::CStr;
+
 use chrono::Local;
 use env_logger::Builder;
 use env_logger::fmt::style::{AnsiColor, Color, Style};
 use log::{Level, LevelFilter};
+
+use crate::protocol_traits::DataControlV1;
+use crate::states::MimeTypesWithData;
 
 pub(crate) fn init_logger(with_timestamps: bool) {
     custom_logger_builder("%Y-%m-%dT%H:%M:%S.%3f", with_timestamps)
@@ -93,5 +98,65 @@ pub(crate) const fn get_clipboard_type_str(is_primary_clipboard: bool, title_cas
         (true, false) => "primary",
         (false, true) => "Regular",
         (false, false) => "regular",
+    }
+}
+
+/// Logs the successfully read data for text mime types. If the data is too long, it is truncated.
+pub(crate) fn log_text_data<DataControl: DataControlV1>(mime_types_with_data: &MimeTypesWithData<'_, DataControl>) {
+    const TEXT_MIME_TYPES: &[&CStr] = &[
+        c"text/plain;charset=utf-8",
+        c"text/plain",
+        c"UTF8_STRING",
+        c"COMPOUND_TEXT",
+        c"STRING",
+        c"TEXT",
+    ];
+    const TRUNCATED_DATA_COUNT: usize = 30;
+
+    for &text_mime_type in TEXT_MIME_TYPES {
+        let Some(data) = mime_types_with_data.data.get(&Box::from(text_mime_type)) else {
+            continue;
+        };
+
+        // Truncate data if necessary
+        let mut truncated_data = String::with_capacity(
+            const {
+                1 // [
+                + TRUNCATED_DATA_COUNT * 3 // "255" or "..."
+                + (TRUNCATED_DATA_COUNT - 1) * 2 // ", "
+                + 1 // ]
+            },
+        );
+        truncated_data.push('[');
+        if data.len() <= TRUNCATED_DATA_COUNT {
+            let mut is_first = true;
+            for x in data.iter() {
+                if !is_first {
+                    truncated_data.push_str(", ");
+                }
+                truncated_data.push_str(&x.to_string());
+                is_first = false;
+            }
+        } else {
+            let mut is_first = true;
+            for x in data.iter().take(TRUNCATED_DATA_COUNT - 1) {
+                if !is_first {
+                    truncated_data.push_str(", ");
+                }
+                truncated_data.push_str(&x.to_string());
+                is_first = false;
+            }
+            truncated_data.push_str(", ...");
+        };
+        truncated_data.push(']');
+
+        // Log data
+        log::trace!(
+            target: &log_seat_target(mime_types_with_data.seat_name),
+            "{} clipboard successfully read data for mime type {:?}: {}",
+            mime_types_with_data.selection_type.get_clipboard_type_str(true),
+            text_mime_type,
+            truncated_data,
+        );
     }
 }
