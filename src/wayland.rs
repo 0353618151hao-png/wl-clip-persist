@@ -1028,7 +1028,13 @@ async fn handle_new_selection_state<'a, DataControl: DataControlV1>(
                 unreachable!();
             };
 
-            if fd_from_own_app.values().next() == Some(&true) {
+            // `any` on an empty iterator returns `false`, so this condition can only
+            // occur if there is at least one file descriptor in the map.
+            // We use `any` instead of `next()` which only compares a single value
+            // in order to not rely on the Wayland server that every mime type we
+            // request is also sent to us (e.g. it could be that it ignores specific
+            // mime types).
+            if fd_from_own_app.values().any(|&x| x) {
                 log::trace!(
                     target: &log_seat_target(seat_name),
                     "Ignoring {} selection event: was triggered by ourselves",
