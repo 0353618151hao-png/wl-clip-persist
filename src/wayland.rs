@@ -810,6 +810,20 @@ fn create_pipes_for_mime_types<DataControl: DataControlV1>(
     let mut mime_types_and_pipes = Vec::with_capacity(unique_mime_types.len());
 
     for mime_type in std::mem::take(unique_mime_types) {
+        // Workaround for issue #17 (https://github.com/Linus789/wl-clip-persist/issues/17).
+        // Basically, the fd for this mime type is never closed on Firefox's side and the
+        // mime type seems to be X11 specific, so I think it is okay to ignore it.
+        const HACK_IGNORED_MIME_TYPES: &[&CStr] = &[c"SAVE_TARGETS"];
+        if HACK_IGNORED_MIME_TYPES.contains(&mime_type.deref().deref()) {
+            log::trace!(
+                target: &log_seat_target(seat_name),
+                "Current {} selection event: ignoring mime type {:?}: workaround for issue #17",
+                selection_type.get_clipboard_type_str(false),
+                mime_type,
+            );
+            continue;
+        }
+
         // Create a pipe to read the data for each mime type
         let (read, write) = match tokio_pipe::pipe() {
             Ok(pipe_ends) => pipe_ends,
