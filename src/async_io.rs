@@ -62,7 +62,7 @@ impl FdWrite {
             } else {
                 match usize::try_from(write_result) {
                     Ok(written_bytes) => return Poll::Ready(Ok(written_bytes)),
-                    Err(err) => return Poll::Ready(Err(std::io::Error::new(ErrorKind::Other, err))),
+                    Err(err) => return Poll::Ready(Err(std::io::Error::other(err))),
                 }
             }
         }

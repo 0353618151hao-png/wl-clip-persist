@@ -88,6 +88,7 @@ async fn run_with_ext_protocol<'a>(
 ) -> Result<GracefulWaylandShutdown, WaylandError> {
     match connection.bind_singleton::<ExtDataControlManagerV1>(1) {
         Ok(ext_data_control_manager) => {
+            #[allow(deprecated)]
             let connection = connection.clear_callbacks::<State<'_, ExtDataControlV1>>();
             if forced {
                 log::trace!(
@@ -154,6 +155,7 @@ async fn run_with_wlr_protocol<'a>(
 
     match zwlr_data_control_manager_result {
         Ok(zwlr_data_control_manager) => {
+            #[allow(deprecated)]
             let connection = connection.clear_callbacks::<State<'_, ZwlrDataControlV1>>();
             if forced {
                 log::trace!(
