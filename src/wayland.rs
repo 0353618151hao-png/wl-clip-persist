@@ -880,6 +880,12 @@ fn create_pipes_for_mime_types<DataControl: DataControlV1>(
         fd_from_own_app.insert(fd_identifier, false);
 
         // We want to receive the data for this mime type
+        log::trace!(
+            target: &log_seat_target(seat_name),
+            "Current {} selection event: requesting to receive data for mime type {:?}",
+            selection_type.get_clipboard_type_str(false),
+            mime_type,
+        );
         data_control_offer.receive(connection, mime_type.deref().clone().into_c_string(), write_file.into());
 
         mime_types_and_pipes.push(MimeTypeAndPipe {
