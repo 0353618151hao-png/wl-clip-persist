@@ -53,6 +53,7 @@ impl DataControlV1 for ZwlrDataControlV1 {
 
 /// Interface for interacting with a data control offer.
 pub(crate) trait DataControlOfferV1: Clone + Copy + Send + Sync + Proxy {
+    #[expect(dead_code)]
     const TYPE_NAME: &'static str;
 
     fn receive<D>(self, conn: &mut Connection<D>, mime_type: CString, fd: OwnedFd);
@@ -90,6 +91,7 @@ impl DataControlOfferV1 for ZwlrDataControlOfferV1 {
 
 /// Interface for interacting with a data control source.
 pub(crate) trait DataControlSourceV1: Clone + Copy + Send + Sync + Proxy {
+    #[expect(dead_code)]
     const TYPE_NAME: &'static str;
 
     fn offer<D>(self, conn: &mut Connection<D>, mime_type: CString);
@@ -182,6 +184,7 @@ impl DataControlDeviceV1 for ZwlrDataControlDeviceV1 {
 
 /// Interface for interacting with a data control manager.
 pub(crate) trait DataControlManagerV1: Clone + Copy + Send + Sync + Proxy {
+    #[expect(dead_code)]
     const TYPE_NAME: &'static str;
 
     type DataControlSource: DataControlSourceV1;
