@@ -78,6 +78,10 @@ pub(crate) struct Settings {
     pub(crate) reconnect_delay: Duration,
     /// If [`Some`], force this specific clipboard protocol, otherwise this is handled automatically.
     pub(crate) force_protocol: Option<ClipboardProtocol>,
+    /// If `true`, do not ignore specific mime types as workaround.
+    pub(crate) disable_workaround_ignore_mime_types: bool,
+    /// If `true`, do not request mime types in specific order as workaround.
+    pub(crate) disable_workaround_order_mime_type_requests: bool,
 }
 
 /// Get the settings for the program.
@@ -152,18 +156,27 @@ pub(crate) fn get_settings() -> Settings {
         )
         .arg(
             arg!(
-                --"disable-timestamps" "Do not show timestamps in the log messages"
-            )
-            .required(false)
-            .action(ArgAction::SetTrue),
-        )
-        .arg(
-            arg!(
                 --"force-protocol" <PROTOCOL> "Force specific clipboard protocol to be used"
             )
             .required(false)
             .hide(true)
             .value_parser(value_parser!(ClipboardProtocol)),
+        )
+        .arg(
+            arg!(
+                --"disable-workaround-ignore-mime-types" "Do not ignore specific mime types as workaround"
+            )
+            .required(false)
+            .hide(true)
+            .action(ArgAction::SetTrue),
+        )
+        .arg(
+            arg!(
+                --"disable-workaround-order-mime-type-requests" "Do not request mime types in specific order as workaround"
+            )
+            .required(false)
+            .hide(true)
+            .action(ArgAction::SetTrue),
         )
         .get_matches();
 
@@ -191,6 +204,8 @@ pub(crate) fn get_settings() -> Settings {
     let reconnect_tries = *matches.get_one::<NumberOrInf<u64>>("reconnect-tries").unwrap();
     let reconnect_delay = Duration::from_millis(*matches.get_one::<u64>("reconnect-delay").unwrap());
     let force_protocol = matches.get_one::<ClipboardProtocol>("force-protocol").copied();
+    let disable_workaround_ignore_mime_types = matches.get_flag("disable-workaround-ignore-mime-types");
+    let disable_workaround_order_mime_type_requests = matches.get_flag("disable-workaround-order-mime-type-requests");
 
     Settings {
         clipboard_type,
@@ -201,5 +216,7 @@ pub(crate) fn get_settings() -> Settings {
         reconnect_tries,
         reconnect_delay,
         force_protocol,
+        disable_workaround_ignore_mime_types,
+        disable_workaround_order_mime_type_requests,
     }
 }

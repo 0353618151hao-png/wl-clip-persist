@@ -787,12 +787,12 @@ fn should_ignore_offer<DataControlOffer: DataControlOfferV1>(
 ///
 /// # Errors
 ///
-/// If `ignore_selection_event_on_error` is `true`
+/// If `settings.ignore_selection_event_on_error` is `true`
 /// and an error occurred while creating the pipe
 /// or reading the metadata of the pipe, the error
 /// is returned immediately in the [`Err`] variant.
 ///
-/// If `ignore_selection_event_on_error` is `false`
+/// If `settings.ignore_selection_event_on_error` is `false`
 /// and an error occurred the mime type is simply
 /// ignored and will not appear in the return value.
 ///
@@ -807,7 +807,7 @@ fn create_pipes_for_mime_types<DataControl: DataControlV1>(
     data_control_offer: DataControl::DataControlOffer,
     unique_mime_types: &mut HashSet<Rc<Box<CStr>>>,
     fd_from_own_app: &mut HashMap<FdIdentifier, bool>,
-    ignore_selection_event_on_error: bool,
+    settings: &Settings,
 ) -> std::io::Result<Option<Vec<MimeTypeAndPipe>>> {
     /// Pairs of mime types that are ignored as workaround with their reason which is printed in trace logs
     const HACK_IGNORED_MIME_TYPES: &[(&CStr, &str)] = &[
@@ -817,103 +817,110 @@ fn create_pipes_for_mime_types<DataControl: DataControlV1>(
         (c"SAVE_TARGETS", "workaround for issue #17"),
     ];
 
-    // We request the mime types in a specific order as a workaround for
-    // issue #22 (https://github.com/Linus789/wl-clip-persist/issues/22),
-    // because otherwise sometimes the data for the "TEXT" mime type is empty.
-    let mut request_sorted_mime_types = std::mem::take(unique_mime_types).into_iter().collect::<Vec<_>>();
-    request_sorted_mime_types.sort_by_key(|mime_type| {
-        // First, request the common text mime types in the order as they are defined in the array
-        const ORDERED_TEXT_MIME_TYPES: &[(&CStr, u8)] = &{
-            const fn with_indices<const N: usize>(arr: [&'static CStr; N]) -> [(&'static CStr, u8); N] {
-                let mut out = [(c"", 0u8); N];
-                let mut i = 0usize;
-                while i < N {
-                    assert!(i <= u8::MAX as usize);
-                    out[i] = (arr[i], i as u8);
-                    i += 1;
+    let mut request_mime_types = std::mem::take(unique_mime_types).into_iter().collect::<Vec<_>>();
+
+    if !settings.disable_workaround_order_mime_type_requests {
+        // We request the mime types in a specific order as a workaround for
+        // issue #22 (https://github.com/Linus789/wl-clip-persist/issues/22),
+        // because otherwise sometimes the data for the "TEXT" mime type is empty.
+        request_mime_types.sort_by_key(|mime_type| {
+            // First, request the common text mime types in the order as they are defined in the array
+            const ORDERED_TEXT_MIME_TYPES: &[(&CStr, u8)] = &{
+                const fn with_indices<const N: usize>(arr: [&'static CStr; N]) -> [(&'static CStr, u8); N] {
+                    let mut out = [(c"", 0u8); N];
+                    let mut i = 0usize;
+                    while i < N {
+                        assert!(i <= u8::MAX as usize);
+                        out[i] = (arr[i], i as u8);
+                        i += 1;
+                    }
+                    out
                 }
-                out
+
+                with_indices([
+                    c"text/plain;charset=utf-8",
+                    c"text/plain",
+                    c"UTF8_STRING",
+                    c"COMPOUND_TEXT",
+                    c"STRING",
+                    c"TEXT",
+                ])
+            };
+            const LAST_SPECIAL_TEXT_KEY: u8 = ORDERED_TEXT_MIME_TYPES.last().unwrap().1;
+            const MIME_TYPE_TEXT_KEY: u8 = LAST_SPECIAL_TEXT_KEY.checked_add(1).unwrap();
+            const MIME_TYPE_UNDERSCORE_TEXT_KEY: u8 = LAST_SPECIAL_TEXT_KEY.checked_add(2).unwrap();
+            const MIME_TYPE_SLASH_KEY: u8 = LAST_SPECIAL_TEXT_KEY.checked_add(3).unwrap();
+            const MIME_TYPE_UNDERSCORE_SLASH_KEY: u8 = LAST_SPECIAL_TEXT_KEY.checked_add(4).unwrap();
+            const FALLBACK_KEY: u8 = u8::MAX.checked_sub(1).unwrap();
+            const {
+                assert!(MIME_TYPE_UNDERSCORE_SLASH_KEY < FALLBACK_KEY);
+            };
+
+            if let Some(&(_, key)) = ORDERED_TEXT_MIME_TYPES
+                .iter()
+                .find(|x| x.0 == mime_type.deref().deref())
+            {
+                return key;
             }
 
-            with_indices([
-                c"text/plain;charset=utf-8",
-                c"text/plain",
-                c"UTF8_STRING",
-                c"COMPOUND_TEXT",
-                c"STRING",
-                c"TEXT",
-            ])
-        };
-        const LAST_SPECIAL_TEXT_KEY: u8 = ORDERED_TEXT_MIME_TYPES.last().unwrap().1;
-        const MIME_TYPE_TEXT_KEY: u8 = LAST_SPECIAL_TEXT_KEY.checked_add(1).unwrap();
-        const MIME_TYPE_UNDERSCORE_TEXT_KEY: u8 = LAST_SPECIAL_TEXT_KEY.checked_add(2).unwrap();
-        const MIME_TYPE_SLASH_KEY: u8 = LAST_SPECIAL_TEXT_KEY.checked_add(3).unwrap();
-        const MIME_TYPE_UNDERSCORE_SLASH_KEY: u8 = LAST_SPECIAL_TEXT_KEY.checked_add(4).unwrap();
-        const FALLBACK_KEY: u8 = u8::MAX.checked_sub(1).unwrap();
-        const {
-            assert!(MIME_TYPE_UNDERSCORE_SLASH_KEY < FALLBACK_KEY);
-        };
+            // Then proceed to prioritize other text mime types (underscores have a lower priority)
+            let mime_type_as_bytes = mime_type.to_bytes();
 
-        if let Some(&(_, key)) = ORDERED_TEXT_MIME_TYPES
-            .iter()
-            .find(|x| x.0 == mime_type.deref().deref())
-        {
-            return key;
-        }
-
-        // Then proceed to prioritize other text mime types (underscores have a lower priority)
-        let mime_type_as_bytes = mime_type.to_bytes();
-
-        if mime_type_as_bytes.starts_with(b"text/") {
-            if !mime_type_as_bytes.contains(&b'_') {
-                return MIME_TYPE_TEXT_KEY;
-            } else {
-                return MIME_TYPE_UNDERSCORE_TEXT_KEY;
+            if mime_type_as_bytes.starts_with(b"text/") {
+                if !mime_type_as_bytes.contains(&b'_') {
+                    return MIME_TYPE_TEXT_KEY;
+                } else {
+                    return MIME_TYPE_UNDERSCORE_TEXT_KEY;
+                }
             }
-        }
 
-        // Then proceed to prioritize other common mime types with a slash in them (underscores have a lower priority)
-        if mime_type_as_bytes.contains(&b'/') {
-            if !mime_type_as_bytes.contains(&b'_') {
-                return MIME_TYPE_SLASH_KEY;
-            } else {
-                return MIME_TYPE_UNDERSCORE_SLASH_KEY;
+            // Then proceed to prioritize other common mime types with a slash in them (underscores have a lower priority)
+            if mime_type_as_bytes.contains(&b'/') {
+                if !mime_type_as_bytes.contains(&b'_') {
+                    return MIME_TYPE_SLASH_KEY;
+                } else {
+                    return MIME_TYPE_UNDERSCORE_SLASH_KEY;
+                }
             }
-        }
 
-        // Prioritize ignored mime types the least (makes a difference in the log output)
-        if HACK_IGNORED_MIME_TYPES.iter().any(|x| x.0 == mime_type.deref().deref()) {
-            return u8::MAX;
-        }
+            if !settings.disable_workaround_ignore_mime_types {
+                // Prioritize ignored mime types the least (makes a difference in the log output)
+                if HACK_IGNORED_MIME_TYPES.iter().any(|x| x.0 == mime_type.deref().deref()) {
+                    return u8::MAX;
+                }
+            }
 
-        // Otherwise put all other mime types (that are not common text ones or contain a slash) before the ignored ones
-        FALLBACK_KEY
-    });
+            // Otherwise put all other mime types (that are not common text ones or contain a slash) before the ignored ones
+            FALLBACK_KEY
+        });
+    }
 
     // Start with creating the pipes and creating the data for each mime type
-    let mut mime_types_and_pipes = Vec::with_capacity(request_sorted_mime_types.len());
+    let mut mime_types_and_pipes = Vec::with_capacity(request_mime_types.len());
 
-    for mime_type in request_sorted_mime_types {
-        // Ignore specific mime types as workaround
-        if let Some(&(_, reason)) = HACK_IGNORED_MIME_TYPES
-            .iter()
-            .find(|x| x.0 == mime_type.deref().deref())
-        {
-            log::trace!(
-                target: &log_seat_target(seat_name),
-                "Current {} selection event: ignoring mime type {:?}: {}",
-                selection_type.get_clipboard_type_str(false),
-                mime_type,
-                reason,
-            );
-            continue;
+    for mime_type in request_mime_types {
+        if !settings.disable_workaround_ignore_mime_types {
+            // Ignore specific mime types as workaround
+            if let Some(&(_, reason)) = HACK_IGNORED_MIME_TYPES
+                .iter()
+                .find(|x| x.0 == mime_type.deref().deref())
+            {
+                log::trace!(
+                    target: &log_seat_target(seat_name),
+                    "Current {} selection event: ignoring mime type {:?}: {}",
+                    selection_type.get_clipboard_type_str(false),
+                    mime_type,
+                    reason,
+                );
+                continue;
+            }
         }
 
         // Create a pipe to read the data for each mime type
         let (read, write) = match tokio_pipe::pipe() {
             Ok(pipe_ends) => pipe_ends,
             Err(err) => {
-                if ignore_selection_event_on_error {
+                if settings.ignore_selection_event_on_error {
                     log::debug!(
                         target: &log_seat_target(seat_name),
                         "Ignoring {} selection event: failed to create pipe: {}",
@@ -940,7 +947,7 @@ fn create_pipes_for_mime_types<DataControl: DataControlV1>(
         let fd_identifier = match FdIdentifier::try_from(&write_file) {
             Ok(fd_identifier) => fd_identifier,
             Err(err) => {
-                if ignore_selection_event_on_error {
+                if settings.ignore_selection_event_on_error {
                     log::debug!(
                         target: &log_seat_target(seat_name),
                         "Ignoring {} selection event: failed to get metadata for pipe: {}",
@@ -1027,7 +1034,7 @@ async fn handle_new_selection_state<'a, DataControl: DataControlV1>(
                             *data_control_offer,
                             unique_mime_types,
                             fd_from_own_app,
-                            state.settings.ignore_selection_event_on_error,
+                            state.settings,
                         );
                         let mime_types_with_pipes = match mime_types_with_pipes_result {
                             Ok(Some(mime_types_with_pipes)) => mime_types_with_pipes,
