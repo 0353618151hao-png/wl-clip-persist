@@ -1,0 +1,27 @@
+name: Build Binary Optimized for Lenovo 80MH
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libclang-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Optimized
+        run: |
+          export RUSTFLAGS="-C target-cpu=silvermont -C opt-level=3"
+          cargo build --release
+
+      - name: Upload Result
+        uses: actions/upload-artifact@v4
+        with:
+          name: wl-clip-persist-lenovo-80MH
+          path: target/release/wl-clip-persist
