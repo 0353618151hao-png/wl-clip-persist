@@ -35,14 +35,18 @@ jobs:
           PYEOF
           fi
 
-          # ═══ BƯỚC 2: Xóa [profile.release] cũ trong Cargo.toml (nếu có), rồi thêm mới ═══
+          # ═══ BƯỚC 2: Sửa Cargo.toml ═══
           python3 << 'PYEOF'
           import re
           with open('Cargo.toml', 'r') as f:
               content = f.read()
+          
+          # Chèn khai báo unstable feature lên dòng đầu tiên (nếu chưa có)
+          if 'cargo-features' not in content:
+              content = 'cargo-features = ["panic-immediate-abort"]\n\n' + content
+              
           sections = re.split(r'(?=^\[)', content, flags=re.MULTILINE)
-          filtered = [s for s in sections
-                      if not s.strip().startswith('[profile.release]')]
+          filtered = [s for s in sections if not s.strip().startswith('[profile.release]')]
           result = ''.join(filtered).rstrip() + """
 
           [profile.release]
@@ -54,7 +58,7 @@ jobs:
           """
           with open('Cargo.toml', 'w') as f:
               f.write(result)
-          print("✓ Updated [profile.release] in Cargo.toml")
+          print("✓ Updated Cargo.toml with panic-immediate-abort")
           PYEOF
 
       - name: Build with Extreme Optimization
