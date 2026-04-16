@@ -9,43 +9,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Dependencies
+      - name: Install Dependencies & Mold Linker
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwayland-dev libclang-dev
+          # Cài thêm mold và clang để hỗ trợ liên kết thần tốc
+          sudo apt-get install -y libwayland-dev libclang-dev mold clang
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build with Extreme Optimization
         run: |
-          # GIẢI THÍCH CÁC CỜ:
-          # target-cpu=silvermont: Tối ưu chính xác cho tập lệnh của chip bạn.
-          # opt-level=3: Tối ưu tốc độ cao nhất.
-          # lto=fat: Tối ưu hóa liên kết toàn cục (Link Time Optimization) mức cao nhất.
-          # codegen-units=1: Ép biên dịch đơn luồng để trình biên dịch có cái nhìn tổng thể nhất (tăng hiệu quả tối ưu).
-          # panic=abort: Loại bỏ code xử lý lỗi không cần thiết, giúp file nhỏ và nhanh hơn.
+          # 1. target-cpu=silvermont: Chính xác cho Intel Celeron N2840/N2940 (Bay Trail).
+          # 2. link-arg=-fuse-ld=mold: Dùng Mold để liên kết cực nhanh và tối ưu LTO.
+          # 3. embed-bitcode=yes: Bắt buộc để fix lỗi incompatible với LTO.
+          # 4. llvm-args=-fp-contract=fast: Tối ưu các phép toán số thực.
+          # 5. strip=symbols: Xóa debug info ngay trong lúc build (gọn hơn bước strip rời).
           
           export RUSTFLAGS="-C target-cpu=silvermont \
+                            -C link-arg=-fuse-ld=mold \
                             -C opt-level=3 \
                             -C lto=fat \
+                            -C llvm-args=-simplifycfg-require-and-preserve-domtree \
                             -C codegen-units=1 \
+                            -C embed-bitcode=yes \
+                            -C llvm-args=-fp-contract=fast \
                             -C panic=abort \
+                            -C strip=symbols \
                             -C relocation-model=static"
           
           cargo build --release
 
-      - name: Post-Processing (Strip & UPX)
+      - name: Post-Processing (UPX)
         run: |
-          # Xóa bỏ các ký hiệu thừa
-          strip target/release/wl-clip-persist
-          
-          # Nếu muốn file cực nhỏ để nạp vào RAM nhanh hơn nữa, có thể cài UPX (tùy chọn)
+          # Vì bạn chạy Wayland trên máy yếu, UPX giúp giảm I/O khi nạp chương trình vào RAM
           sudo apt-get install -y upx
           upx --ultra --best target/release/wl-clip-persist
 
       - name: Upload Result
         uses: actions/upload-artifact@v4
         with:
-          name: wl-clip-persist-MAX-OPTIMIZED
+          name: wl-clip-persist-LENOVO-80MH-SUPER-OPTIMIZED
           path: target/release/wl-clip-persist
