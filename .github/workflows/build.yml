@@ -4,46 +4,50 @@ on: workflow_dispatch
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Dependencies & Mold Linker
+      - name: Install Dependencies (Mold, Wayland, LLVM)
         run: |
           sudo apt-get update
-          # Cài thêm mold và clang để hỗ trợ liên kết thần tốc
-          sudo apt-get install -y libwayland-dev libclang-dev mold clang
+          sudo apt-get install -y libwayland-dev libclang-dev mold clang upx
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build with Extreme Optimization
+      - name: Configure Cargo for Extreme Optimization
         run: |
-          # 1. target-cpu=silvermont: Chính xác cho Intel Celeron N2840/N2940 (Bay Trail).
-          # 2. link-arg=-fuse-ld=mold: Dùng Mold để liên kết cực nhanh và tối ưu LTO.
-          # 3. embed-bitcode=yes: Bắt buộc để fix lỗi incompatible với LTO.
-          # 4. llvm-args=-fp-contract=fast: Tối ưu các phép toán số thực.
-          # 5. strip=symbols: Xóa debug info ngay trong lúc build (gọn hơn bước strip rời).
-          
-          export RUSTFLAGS="-C target-cpu=silvermont \
-                            -C link-arg=-fuse-ld=mold \
-                            -C opt-level=3 \
-                            -C lto=fat \
-                            -C llvm-args=-simplifycfg-require-and-preserve-domtree \
-                            -C codegen-units=1 \
-                            -C embed-bitcode=yes \
-                            -C llvm-args=-fp-contract=fast \
-                            -C panic=abort \
-                            -C strip=symbols \
-                            -C relocation-model=static"
-          
-          cargo build --release
+          mkdir -p .cargo
+          cat <<EOF > .cargo/config.toml
+          [profile.release]
+          opt-level = 3
+          lto = "fat"
+          codegen-units = 1
+          panic = "abort"
+          strip = "symbols"
 
-      - name: Post-Processing (UPX)
+          # Sửa lỗi proc-macro bằng cách hạ cấp tối ưu hóa cho công cụ build
+          [profile.release.build-override]
+          opt-level = 0
+          lto = false
+
+          [target.'cfg(all())']
+          rustflags = [
+            "-C", "target-cpu=silvermont",
+            "-C", "link-arg=-fuse-ld=mold",
+            "-C", "embed-bitcode=yes",
+            "-C", "relocation-model=static",
+            "-C", "llvm-args=-fp-contract=fast",
+            "-C", "llvm-args=-simplifycfg-require-and-preserve-domtree"
+          ]
+          EOF
+
+      - name: Build Release Binary
+        run: cargo build --release
+
+      - name: Compress with UPX
         run: |
-          # Vì bạn chạy Wayland trên máy yếu, UPX giúp giảm I/O khi nạp chương trình vào RAM
-          sudo apt-get install -y upx
+          # Giảm kích thước file để load nhanh hơn trên ổ cứng HDD/eMMC của Lenovo 80MH
           upx --ultra --best target/release/wl-clip-persist
 
       - name: Upload Result
