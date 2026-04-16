@@ -1,9 +1,11 @@
-name: Build Binary Optimized for Lenovo 80MH
+name: Build Binary Maximum Optimized for Lenovo 80MH
 on: workflow_dispatch
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v4
 
@@ -15,13 +17,35 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Optimized
+      - name: Build with Extreme Optimization
         run: |
-          export RUSTFLAGS="-C target-cpu=silvermont -C opt-level=3"
+          # GIẢI THÍCH CÁC CỜ:
+          # target-cpu=silvermont: Tối ưu chính xác cho tập lệnh của chip bạn.
+          # opt-level=3: Tối ưu tốc độ cao nhất.
+          # lto=fat: Tối ưu hóa liên kết toàn cục (Link Time Optimization) mức cao nhất.
+          # codegen-units=1: Ép biên dịch đơn luồng để trình biên dịch có cái nhìn tổng thể nhất (tăng hiệu quả tối ưu).
+          # panic=abort: Loại bỏ code xử lý lỗi không cần thiết, giúp file nhỏ và nhanh hơn.
+          
+          export RUSTFLAGS="-C target-cpu=silvermont \
+                            -C opt-level=3 \
+                            -C lto=fat \
+                            -C codegen-units=1 \
+                            -C panic=abort \
+                            -C relocation-model=static"
+          
           cargo build --release
+
+      - name: Post-Processing (Strip & UPX)
+        run: |
+          # Xóa bỏ các ký hiệu thừa
+          strip target/release/wl-clip-persist
+          
+          # Nếu muốn file cực nhỏ để nạp vào RAM nhanh hơn nữa, có thể cài UPX (tùy chọn)
+          sudo apt-get install -y upx
+          upx --ultra --best target/release/wl-clip-persist
 
       - name: Upload Result
         uses: actions/upload-artifact@v4
         with:
-          name: wl-clip-persist-lenovo-80MH
+          name: wl-clip-persist-MAX-OPTIMIZED
           path: target/release/wl-clip-persist
