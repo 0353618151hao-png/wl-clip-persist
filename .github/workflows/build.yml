@@ -4,51 +4,85 @@ on: workflow_dispatch
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Dependencies (Mold, Wayland, LLVM)
+      - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwayland-dev libclang-dev mold clang upx
+          sudo apt-get install -y libwayland-dev libclang-dev mold clang
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust Nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
 
-      - name: Configure Cargo for Extreme Optimization
+      - name: Fix .cargo/config.toml & Configure Cargo.toml Profile
         run: |
-          mkdir -p .cargo
-          cat <<EOF > .cargo/config.toml
+          # ═══ BƯỚC 1: Xóa [profile.*] khỏi .cargo/config.toml ═══
+          if [ -f .cargo/config.toml ]; then
+            python3 << 'PYEOF'
+          import re
+          with open('.cargo/config.toml', 'r') as f:
+              content = f.read()
+          sections = re.split(r'(?=^\[)', content, flags=re.MULTILINE)
+          filtered = [s for s in sections if not s.strip().startswith('[profile.')]
+          with open('.cargo/config.toml', 'w') as f:
+              f.write(''.join(filtered))
+          print("✓ Removed [profile.*] from .cargo/config.toml")
+          PYEOF
+          fi
+
+          # ═══ BƯỚC 2: Xóa [profile.release] cũ trong Cargo.toml (nếu có), rồi thêm mới ═══
+          python3 << 'PYEOF'
+          import re
+          with open('Cargo.toml', 'r') as f:
+              content = f.read()
+          sections = re.split(r'(?=^\[)', content, flags=re.MULTILINE)
+          filtered = [s for s in sections
+                      if not s.strip().startswith('[profile.release]')]
+          result = ''.join(filtered).rstrip() + """
+
           [profile.release]
           opt-level = 3
           lto = "fat"
           codegen-units = 1
           panic = "abort"
           strip = "symbols"
+          """
+          with open('Cargo.toml', 'w') as f:
+              f.write(result)
+          print("✓ Updated [profile.release] in Cargo.toml")
+          PYEOF
 
-          # Sửa lỗi proc-macro bằng cách hạ cấp tối ưu hóa cho công cụ build
-          [profile.release.build-override]
-          opt-level = 0
-          lto = false
-
-          [target.'cfg(all())']
-          rustflags = [
-            "-C", "target-cpu=silvermont",
-            "-C", "link-arg=-fuse-ld=mold",
-            "-C", "embed-bitcode=yes",
-            "-C", "relocation-model=static",
-            "-C", "llvm-args=-fp-contract=fast",
-            "-C", "llvm-args=-simplifycfg-require-and-preserve-domtree"
-          ]
-          EOF
-
-      - name: Build Release Binary
-        run: cargo build --release
-
-      - name: Compress with UPX
+      - name: Build with Extreme Optimization
         run: |
-          # Giảm kích thước file để load nhanh hơn trên ổ cứng HDD/eMMC của Lenovo 80MH
-          upx --ultra --best target/release/wl-clip-persist
+          # ═══════════════════════════════════════════════════════════════
+          #  TỐI ƯU CHO INTEL CELERON N2840 (Bay Trail / Silvermont)
+          # ═══════════════════════════════════════════════════════════════
+
+          export RUSTFLAGS="\
+            -C target-cpu=silvermont \
+            -C target-feature=+sse4.2,+popcnt \
+            -C embed-bitcode=yes \
+            -C link-arg=-fuse-ld=mold \
+            -C link-arg=-Wl,--gc-sections \
+            -C link-arg=-Wl,-O3 \
+            -C link-arg=-Wl,--as-needed \
+            -C link-arg=-Wl,--hash-style=gnu \
+            -C link-arg=-Wl,--sort-common \
+            -C llvm-args=-fp-contract=fast \
+            -C llvm-args=-simplifycfg-require-and-preserve-domtree \
+            -Z share-generics=y"
+
+          # -Z build-std:          Build lại std từ source với cờ Silvermont
+          #                         (std bản prebuilt chỉ tối ưu cho x86_64 generic)
+          # -Z build-std-features: Bỏ hoàn toàn unwind overhead trong std
+          cargo +nightly build --release \
+            -Z build-std=std,panic_abort \
+            -Z build-std-features=panic_immediate_abort
 
       - name: Upload Result
         uses: actions/upload-artifact@v4
